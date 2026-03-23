@@ -33,7 +33,13 @@
 
     <!-- 下单界面 -->
     <div class="order-section">
-      <h3>下单</h3>
+      <div class="section-header">
+        <h3>下单</h3>
+        <div class="mode-switch">
+          <span :class="{ active: !isDemo }" @click="isDemo = false">实盘</span>
+          <span :class="{ active: isDemo }" @click="isDemo = true">模拟盘</span>
+        </div>
+      </div>
       
       <!-- 买卖切换 -->
       <div class="order-type-switch">
@@ -139,6 +145,7 @@ const orderPrice = ref(null)
 const orderQuantity = ref(null)
 const positions = ref([])
 const refreshing = ref(false)
+const isDemo = ref(true) // 默认模拟盘
 
 // 计算属性
 const canSubmit = computed(() => {
@@ -222,16 +229,100 @@ const loadTicker = async (symbol) => {
 }
 
 const loadPositions = async () => {
-  try {
-    const response = await fetch('/api/v1/trade/positions')
-    const data = await response.json()
-    positions.value = data.positions || []
-  } catch (error) {
-    console.error('加载持仓失败:', error)
+  if (isDemo.value) {
+    // 加载模拟持仓
+    const demoPositions = JSON.parse(localStorage.getItem('demo_positions') || '[]')
+    // 更新当前价格
+    for (let pos of demoPositions) {
+      pos.currentPrice = currentPrice.value || pos.entryPrice
+      if (pos.side === 'buy') {
+        pos.pnl = (pos.currentPrice - pos.entryPrice) * pos.size
+      } else {
+        pos.pnl = (pos.entryPrice - pos.currentPrice) * pos.size
+      }
+    }
+    positions.value = demoPositions
+  } else {
+    // 加载实盘持仓
+    try {
+      const response = await fetch('/api/v1/trade/positions')
+      const data = await response.json()
+      positions.value = data.positions || []
+    } catch (error) {
+      console.error('加载持仓失败:', error)
+    }
   }
 }
 
 const submitOrder = async () => {
+  if (isDemo.value) {
+    // 模拟盘模式
+    await submitDemoOrder()
+  } else {
+    // 实盘模式
+    await submitRealOrder()
+  }
+}
+
+const submitDemoOrder = async () => {
+  try {
+    // 模拟订单提交
+    const demoOrder = {
+      strategy_id: 'manual',
+      symbol: selectedSymbol.value,
+      side: orderSide.value,
+      quantity: orderQuantity.value.toString(),
+      price: orderType.value === 'limit' ? orderPrice.value.toString() : currentPrice.value.toString(),
+      order_type: orderType.value,
+      is_demo: true,
+      timestamp: new Date().toISOString(),
+    }
+    
+    // 保存到本地存储
+    const demoOrders = JSON.parse(localStorage.getItem('demo_orders') || '[]')
+    demoOrders.push(demoOrder)
+    localStorage.setItem('demo_orders', JSON.stringify(demoOrders))
+    
+    // 更新模拟持仓
+    updateDemoPosition(demoOrder)
+    
+    alert(`✅ 模拟下单成功！\n交易对：${selectedSymbol.value}\n方向：${orderSide.value === 'buy' ? '买入' : '卖出'}\n数量：${orderQuantity.value}\n价格：${demoOrder.price}`)
+    
+    orderQuantity.value = null
+    orderPrice.value = null
+    loadPositions()
+  } catch (error) {
+    console.error('模拟下单失败:', error)
+    alert('模拟下单失败')
+  }
+}
+
+const updateDemoPosition = (order) => {
+  // 简单的模拟持仓更新逻辑
+  const demoPositions = JSON.parse(localStorage.getItem('demo_positions') || '[]')
+  const existingPos = demoPositions.find(p => p.symbol === order.symbol)
+  
+  if (existingPos) {
+    // 更新现有持仓
+    const avgPrice = (parseFloat(existingPos.entryPrice) * parseFloat(existingPos.size) + parseFloat(order.price) * parseFloat(order.quantity)) / (parseFloat(existingPos.size) + parseFloat(order.quantity))
+    existingPos.entryPrice = avgPrice.toFixed(2)
+    existingPos.size = (parseFloat(existingPos.size) + parseFloat(order.quantity)).toFixed(3)
+  } else {
+    // 新建持仓
+    demoPositions.push({
+      symbol: order.symbol,
+      side: order.side,
+      size: order.quantity,
+      entryPrice: order.price,
+      currentPrice: order.price,
+      pnl: 0,
+    })
+  }
+  
+  localStorage.setItem('demo_positions', JSON.stringify(demoPositions))
+}
+
+const submitRealOrder = async () => {
   try {
     const response = await fetch('/api/v1/trade/execute', {
       method: 'POST',
@@ -296,6 +387,33 @@ onMounted(() => {
   margin: 0;
   font-size: 16px;
   color: #333;
+}
+
+.mode-switch {
+  display: flex;
+  background: #f0f0f0;
+  border-radius: 20px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.mode-switch span {
+  padding: 5px 15px;
+  border-radius: 17px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.3s;
+  color: #666;
+}
+
+.mode-switch span.active {
+  background: #409EFF;
+  color: white;
+  font-weight: bold;
+}
+
+.mode-switch span:hover:not(.active) {
+  background: #e0e0e0;
 }
 
 .refresh-btn {
