@@ -21,7 +21,11 @@
           
           <div class="form-group">
             <label>交易对</label>
-            <input type="text" v-model="config.symbol" placeholder="BTCUSDT" />
+            <select v-model="config.symbol">
+              <option v-for="symbol in tradingSymbols" :key="symbol" :value="symbol">
+                {{ symbol }}
+              </option>
+            </select>
           </div>
           
           <div class="form-group">
@@ -81,6 +85,7 @@ import BacktestResult from '@/components/BacktestResult.vue'
 import { api } from '@/api/client.js'
 
 const strategies = ref([])
+const tradingSymbols = ref([])
 const running = ref(false)
 const progress = ref(0)
 const result = ref(null)
@@ -101,6 +106,34 @@ const loadStrategies = async () => {
     strategies.value = data.strategies || []
   } catch (error) {
     console.error('加载策略失败:', error)
+  }
+}
+
+const loadTradingSymbols = async () => {
+  try {
+    // 从交易所获取热门交易对
+    const symbols = [
+      'BTCUSDT',
+      'ETHUSDT',
+      'SOLUSDT',
+      'BNBUSDT',
+      'XRPUSDT',
+      'ADAUSDT',
+      'DOGEUSDT',
+      'AVAXUSDT',
+      'DOTUSDT',
+      'MATICUSDT',
+      'LINKUSDT',
+      'UNIUSDT',
+      'ATOMUSDT',
+      'LTCUSDT',
+      'ETCUSDT',
+    ]
+    tradingSymbols.value = symbols
+  } catch (error) {
+    console.error('加载交易对失败:', error)
+    // 默认交易对
+    tradingSymbols.value = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
   }
 }
 
@@ -148,6 +181,7 @@ const runBacktest = async () => {
 
 onMounted(() => {
   loadStrategies()
+  loadTradingSymbols()
 })
 </script>
 
