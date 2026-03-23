@@ -113,27 +113,27 @@ const loadTradingSymbols = async () => {
   try {
     // 从交易所获取热门交易对
     const symbols = [
-      'BTCUSDT',
-      'ETHUSDT',
-      'SOLUSDT',
-      'BNBUSDT',
-      'XRPUSDT',
-      'ADAUSDT',
-      'DOGEUSDT',
-      'AVAXUSDT',
-      'DOTUSDT',
-      'MATICUSDT',
-      'LINKUSDT',
-      'UNIUSDT',
-      'ATOMUSDT',
-      'LTCUSDT',
-      'ETCUSDT',
+      'BTC/USDT',
+      'ETH/USDT',
+      'SOL/USDT',
+      'BNB/USDT',
+      'XRP/USDT',
+      'ADA/USDT',
+      'DOGE/USDT',
+      'AVAX/USDT',
+      'DOT/USDT',
+      'MATIC/USDT',
+      'LINK/USDT',
+      'UNI/USDT',
+      'ATOM/USDT',
+      'LTC/USDT',
+      'ETC/USDT',
     ]
     tradingSymbols.value = symbols
   } catch (error) {
     console.error('加载交易对失败:', error)
     // 默认交易对
-    tradingSymbols.value = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+    tradingSymbols.value = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
   }
 }
 
