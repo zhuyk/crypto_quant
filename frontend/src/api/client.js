@@ -139,6 +139,18 @@ export const api = {
     status: () => apiClient.get('/health'),
     detailed: () => apiClient.get('/health/detailed'),
   },
+  
+  // 套利策略
+  arbitrage: {
+    // 资金费率套利
+    startFundingRateArbitrage: (config) => apiClient.post('/arbitrage/funding_rate/start', config),
+    stopFundingRateArbitrage: (strategyId) => apiClient.post('/arbitrage/funding_rate/stop', { strategy_id: strategyId }),
+    getFundingRateSignals: (minRate) => apiClient.get('/arbitrage/funding_rate/signals', { params: { min_rate: minRate } }),
+    getFundingRatePositions: () => apiClient.get('/arbitrage/funding_rate/positions'),
+    closePosition: (symbol) => apiClient.post(`/arbitrage/funding_rate/close/${symbol}`),
+    getStrategyStatus: () => apiClient.get('/arbitrage/funding_rate/status'),
+    getFundingRates: (exchange) => apiClient.get('/arbitrage/funding_rate/rates', { params: { exchange } }),
+  },
 }
 
 export default apiClient

@@ -56,6 +56,11 @@
           <span class="icon">📁</span>
           <span v-if="!sidebarCollapsed">数据</span>
         </router-link>
+        
+        <router-link to="/arbitrage" class="nav-item">
+          <span class="icon">💰</span>
+          <span v-if="!sidebarCollapsed">套利</span>
+        </router-link>
       </nav>
       
       <div class="sidebar-footer">

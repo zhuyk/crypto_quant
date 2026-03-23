@@ -61,6 +61,12 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/arbitrage',
+    name: 'Arbitrage',
+    component: () => import('@/views/Arbitrage.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/login',
     name: 'Login',
     component: () => import('@/views/Login.vue'),
