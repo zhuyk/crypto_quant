@@ -18,14 +18,14 @@ from decimal import Decimal
 import asyncio
 from datetime import datetime, timedelta
 
-from strategies.base import BaseStrategy, Signal, SignalType
+from strategies.base import Strategy, Signal, SignalType
 from app.core.config import settings
-from app.utils.logging_config import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
-class FundingRateArbitrage(BaseStrategy):
+class FundingRateArbitrage(Strategy):
     """
     资金费率套利策略
     
@@ -86,21 +86,45 @@ class FundingRateArbitrage(BaseStrategy):
             {symbol: {funding_rate, next_funding_time, mark_price, index_price}}
         """
         # TODO: 实现交易所 API 调用
-        # 这里使用模拟数据
+        # 这里使用模拟数据（使用标准格式 BTC/USDT）
         return {
-            "BTCUSDT": {
+            "BTC/USDT": {
                 "funding_rate": 0.0001,
                 "next_funding_time": datetime.now() + timedelta(hours=8),
                 "mark_price": 68800,
                 "index_price": 68795,
             },
-            "ETHUSDT": {
+            "ETH/USDT": {
                 "funding_rate": 0.00015,
                 "next_funding_time": datetime.now() + timedelta(hours=8),
                 "mark_price": 3450,
                 "index_price": 3448,
             },
+            "SOL/USDT": {
+                "funding_rate": 0.00012,
+                "next_funding_time": datetime.now() + timedelta(hours=8),
+                "mark_price": 145,
+                "index_price": 144.8,
+            },
+            "BNB/USDT": {
+                "funding_rate": 8e-05,
+                "next_funding_time": datetime.now() + timedelta(hours=8),
+                "mark_price": 580,
+                "index_price": 579.5,
+            },
+            "XRP/USDT": {
+                "funding_rate": 5e-05,
+                "next_funding_time": datetime.now() + timedelta(hours=8),
+                "mark_price": 0.62,
+                "index_price": 0.619,
+            },
         }
+    
+    def generate_signal(self, data) -> None:
+        """实现基类的抽象方法（资金费率套利不使用 K 线数据生成信号）"""
+        # 资金费率套利基于费率数据，不是 K 线数据
+        # 使用 generate_signals_arbitrage 方法代替
+        return None
     
     async def generate_signals(self) -> List[Signal]:
         """

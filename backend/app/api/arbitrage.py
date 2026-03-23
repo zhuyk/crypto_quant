@@ -4,18 +4,16 @@
 提供资金费率套利的管理接口
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional
 from decimal import Decimal
 import asyncio
 
-from app.core.auth.auth_middleware import get_current_user
-from app.models.user import User
 from strategies.arbitrage.funding_rate import FundingRateArbitrage
-from app.utils.logging_config import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/arbitrage", tags=["套利策略"])
 
@@ -31,34 +29,11 @@ class FundingRateConfig(BaseModel):
     exchanges: List[str] = Field(["binance", "bybit"], description="支持的交易所")
 
 
-class ArbitrageSignal(BaseModel):
-    """套利信号"""
-    symbol: str
-    exchange: str
-    funding_rate: float
-    annual_return: float
-    side: str  # LONG 或 SHORT
-    reason: str
-
-
-class PositionInfo(BaseModel):
-    """持仓信息"""
-    symbol: str
-    side: str
-    entry_price: float
-    quantity: float
-    funding_earned: float
-    open_time: str
-
-
 @router.post("/funding_rate/start")
-async def start_funding_rate_arbitrage(
-    config: FundingRateConfig,
-    current_user: User = Depends(get_current_user)
-):
+async def start_funding_rate_arbitrage(config: FundingRateConfig):
     """启动资金费率套利"""
     try:
-        strategy_id = f"funding_rate_{current_user.id}"
+        strategy_id = "funding_rate_default"
         
         # 创建策略实例
         strategy = FundingRateArbitrage(config={
@@ -74,7 +49,7 @@ async def start_funding_rate_arbitrage(
         # 保存策略
         _arbitrage_strategies[strategy_id] = strategy
         
-        logger.info(f"用户 {current_user.id} 启动资金费率套利")
+        logger.info(f"启动资金费率套利")
         
         return {
             "success": True,
@@ -88,13 +63,9 @@ async def start_funding_rate_arbitrage(
 
 
 @router.post("/funding_rate/stop")
-async def stop_funding_rate_arbitrage(
-    strategy_id: Optional[str] = None,
-    current_user: User = Depends(get_current_user)
-):
+async def stop_funding_rate_arbitrage():
     """停止资金费率套利"""
-    if not strategy_id:
-        strategy_id = f"funding_rate_{current_user.id}"
+    strategy_id = "funding_rate_default"
     
     if strategy_id not in _arbitrage_strategies:
         raise HTTPException(status_code=404, detail="策略未运行")
@@ -110,7 +81,7 @@ async def stop_funding_rate_arbitrage(
         # 移除策略
         del _arbitrage_strategies[strategy_id]
         
-        logger.info(f"用户 {current_user.id} 停止资金费率套利")
+        logger.info(f"停止资金费率套利，平仓 {len(positions)} 个持仓")
         
         return {
             "success": True,
@@ -123,10 +94,7 @@ async def stop_funding_rate_arbitrage(
 
 
 @router.get("/funding_rate/signals")
-async def get_funding_rate_signals(
-    min_rate: float = 0.0001,
-    current_user: User = Depends(get_current_user)
-):
+async def get_funding_rate_signals(min_rate: float = 0.0001):
     """获取资金费率套利机会"""
     try:
         # 创建临时策略实例用于扫描
@@ -157,11 +125,9 @@ async def get_funding_rate_signals(
 
 
 @router.get("/funding_rate/positions")
-async def get_funding_rate_positions(
-    current_user: User = Depends(get_current_user)
-):
+async def get_funding_rate_positions():
     """获取当前套利持仓"""
-    strategy_id = f"funding_rate_{current_user.id}"
+    strategy_id = "funding_rate_default"
     
     if strategy_id not in _arbitrage_strategies:
         return {
@@ -187,12 +153,9 @@ async def get_funding_rate_positions(
 
 
 @router.post("/funding_rate/close/{symbol}")
-async def close_position(
-    symbol: str,
-    current_user: User = Depends(get_current_user)
-):
+async def close_position(symbol: str):
     """平掉某个持仓"""
-    strategy_id = f"funding_rate_{current_user.id}"
+    strategy_id = "funding_rate_default"
     
     if strategy_id not in _arbitrage_strategies:
         raise HTTPException(status_code=404, detail="策略未运行")
@@ -221,11 +184,9 @@ async def close_position(
 
 
 @router.get("/funding_rate/status")
-async def get_strategy_status(
-    current_user: User = Depends(get_current_user)
-):
+async def get_strategy_status():
     """获取策略运行状态"""
-    strategy_id = f"funding_rate_{current_user.id}"
+    strategy_id = "funding_rate_default"
     
     if strategy_id not in _arbitrage_strategies:
         return {
@@ -250,10 +211,7 @@ async def get_strategy_status(
 
 
 @router.get("/funding_rate/rates")
-async def get_funding_rates(
-    exchange: Optional[str] = None,
-    current_user: User = Depends(get_current_user)
-):
+async def get_funding_rates(exchange: Optional[str] = None):
     """获取最新资金费率"""
     try:
         strategy = FundingRateArbitrage()
