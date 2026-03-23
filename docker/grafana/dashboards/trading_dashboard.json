@@ -1,0 +1,177 @@
+{
+  "dashboard": {
+    "title": "CryptoQuant 交易监控",
+    "tags": ["crypto", "trading", "monitoring"],
+    "timezone": "Asia/Shanghai",
+    "panels": [
+      {
+        "id": 1,
+        "title": "实时交易量",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "sum(rate(trading_orders_total[5m]))",
+            "legendFormat": "订单/秒"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 10},
+                {"color": "red", "value": 50}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "当前回撤",
+        "type": "gauge",
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "risk_current_drawdown * 100",
+            "legendFormat": "回撤 %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 20,
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 5},
+                {"color": "red", "value": 10}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "日盈亏",
+        "type": "stat",
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "trading_daily_pnl",
+            "legendFormat": "USDT"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 0},
+                {"color": "green", "value": 100}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "title": "API 响应时间",
+        "type": "graph",
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50"
+          }
+        ],
+        "yAxes": [
+          {"label": "秒", "min": 0}
+        ]
+      },
+      {
+        "id": 5,
+        "title": "交易所连接状态",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "exchange_connection_status",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {"Time": true, "__name__": true},
+              "renameByName": {
+                "exchange": "交易所",
+                "Value": "状态"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "策略表现",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "strategy_cumulative_pnl",
+            "legendFormat": "{{strategy}}"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "订单执行统计",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 10, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "sum(rate(trading_orders_filled_total[5m]))",
+            "legendFormat": "成交订单"
+          },
+          {
+            "expr": "sum(rate(trading_orders_failed_total[5m]))",
+            "legendFormat": "失败订单"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "title": "系统资源",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 10, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "rate(process_cpu_seconds_total[5m])",
+            "legendFormat": "CPU"
+          },
+          {
+            "expr": "process_resident_memory_bytes / 1024 / 1024",
+            "legendFormat": "内存 (MB)"
+          }
+        ]
+      }
+    ],
+    "refresh": "5s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "version": 1
+  }
+}

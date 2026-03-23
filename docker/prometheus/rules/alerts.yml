@@ -1,0 +1,104 @@
+# Prometheus 告警规则
+groups:
+  - name: cryptoquant_alerts
+    interval: 30s
+    rules:
+      # 服务宕机告警
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务 {{ $labels.job }} 宕机"
+          description: "{{ $labels.instance }} 的服务 {{ $labels.job }} 已经宕机超过 1 分钟"
+
+      # API 响应时间过长
+      - alert: HighAPILatency
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API 响应时间过长"
+          description: "95% 的 API 请求响应时间超过 1 秒"
+
+      # 错误率过高
+      - alert: HighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "错误率过高"
+          description: "5 分钟平均错误率超过 5%"
+
+      # MySQL 连接数过多
+      - alert: MySQLHighConnections
+        expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MySQL 连接数过高"
+          description: "MySQL 连接数使用率超过 80%"
+
+      # Redis 内存使用过高
+      - alert: RedisHighMemory
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis 内存使用过高"
+          description: "Redis 内存使用率超过 80%"
+
+      # 磁盘空间不足
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘空间不足"
+          description: "{{ $labels.mountpoint }} 磁盘使用率超过 80%"
+
+      # 交易订单失败
+      - alert: TradingOrderFailed
+        expr: rate(trading_orders_failed_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "交易订单失败"
+          description: "检测到交易订单失败，请立即检查"
+
+      # 数据采集延迟
+      - alert: DataCollectionDelay
+        expr: (time() - data_collector_last_update_timestamp) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "数据采集延迟"
+          description: "数据采集超过 5 分钟未更新"
+
+      # 最大回撤超限
+      - alert: MaxDrawdownExceeded
+        expr: trading_max_drawdown > 0.08
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "最大回撤超限"
+          description: "当前最大回撤 {{ $value | humanizePercentage }} 超过阈值 8%"
+
+      # 单日亏损超限
+      - alert: DailyLossExceeded
+        expr: trading_daily_pnl < -0.02
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "单日亏损超限"
+          description: "今日亏损 {{ $value | humanizePercentage }} 超过阈值 2%"
