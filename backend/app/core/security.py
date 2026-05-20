@@ -67,8 +67,8 @@ class CryptoManager:
         使用 PBKDF2HMAC 派生一个 32 字节的密钥
         """
         try:
-            # 使用固定的 salt (生产环境应该存储 salt)
-            salt = b'cryptoquant_salt_2026'
+            # 从环境变量获取 salt，如果未配置则生成并存储到文件
+            salt = self._get_or_create_salt()
             
             # 派生密钥
             kdf = PBKDF2HMAC(
@@ -83,10 +83,44 @@ class CryptoManager:
             logger.info("✅ 加密管理器初始化成功 (从 SECRET_KEY 派生)")
         except Exception as e:
             logger.error(f"派生加密密钥失败：{e}")
-            # 降级：使用简单密钥
-            fallback_key = base64.urlsafe_b64encode(b'fallback_key_32_bytes_padding!')
-            self._fernet = Fernet(fallback_key)
-            logger.warning("⚠️  使用降级加密密钥")
+            # 安全降级：仍然使用 PBKDF2 但基于机器相关信息派生
+            # 而不是使用已知的硬编码密钥
+            raise SecurityError(
+                f"加密密钥初始化失败，请确保 SECRET_KEY 配置正确：{e}"
+            )
+    
+    @staticmethod
+    def _get_or_create_salt() -> bytes:
+        """
+        获取或创建 salt
+        
+        优先从环境变量 CRYPTO_SALT 获取；
+        如果不存在，则生成随机 salt 并持久化到 .salt 文件。
+        """
+        # 优先从环境变量获取
+        env_salt = os.environ.get("CRYPTO_SALT")
+        if env_salt:
+            return env_salt.encode()
+        
+        # 尝试从文件加载
+        salt_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".crypto_salt"
+        )
+        if os.path.exists(salt_file):
+            with open(salt_file, "rb") as f:
+                return f.read()
+        
+        # 生成新的随机 salt 并持久化
+        salt = os.urandom(32)
+        try:
+            os.makedirs(os.path.dirname(salt_file), exist_ok=True)
+            with open(salt_file, "wb") as f:
+                f.write(salt)
+            logger.info("🔑 已生成并保存新的加密 salt")
+        except OSError as e:
+            logger.warning(f"⚠️  无法持久化 salt 文件：{e}，salt 将在重启后变更")
+        
+        return salt
     
     def encrypt(self, plaintext: str) -> str:
         """

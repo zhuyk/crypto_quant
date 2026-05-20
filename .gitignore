@@ -56,6 +56,7 @@ logs/
 *.pem
 *.key
 secrets/
+.crypto_salt
 
 # Test coverage
 htmlcov/

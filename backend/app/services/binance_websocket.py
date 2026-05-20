@@ -66,6 +66,8 @@ class BinanceWebSocket:
         self._reconnect_delay = 5
         self._message_count = 0
         self._last_message_time = 0
+        self._connect_task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         
         # 数据回调
         self._kline_callbacks: List[Callable] = []
@@ -266,32 +268,101 @@ class BinanceWebSocket:
                         except asyncio.TimeoutError:
                             # 发送心跳
                             await ws.ping()
+                        except asyncio.CancelledError:
+                            logger.info("📡 WebSocket 接收被取消，正在关闭...")
+                            return
                 
             except ConnectionClosed as e:
                 logger.warning(f"⚠️  WebSocket 连接关闭：{e}")
             except WebSocketException as e:
                 logger.error(f"❌ WebSocket 错误：{e}")
+            except asyncio.CancelledError:
+                logger.info("📡 WebSocket 连接任务被取消")
+                return
             except Exception as e:
                 logger.error(f"❌ 连接异常：{e}", exc_info=True)
             
             if self._running:
                 logger.info(f"🔄 {self._reconnect_delay}s 后重连...")
-                await asyncio.sleep(self._reconnect_delay)
+                try:
+                    await asyncio.sleep(self._reconnect_delay)
+                except asyncio.CancelledError:
+                    logger.info("📡 重连等待被取消")
+                    return
     
     def start(self):
-        """启动连接"""
+        """启动连接（同步方式，在新事件循环中阻塞运行）"""
         self._running = True
         logger.info("🚀 Binance WebSocket 启动中...")
         
         # 在新线程中运行
         loop = asyncio.new_event_loop()
+        self._loop = loop
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self.connect())
     
-    def stop(self):
-        """停止连接"""
+    async def start_async(self):
+        """启动连接（异步方式，返回可取消的 Task）"""
+        self._running = True
+        logger.info("🚀 Binance WebSocket 异步启动中...")
+        self._connect_task = asyncio.create_task(self.connect())
+        return self._connect_task
+    
+    async def stop_async(self):
+        """
+        优雅关闭 WebSocket（异步版本）
+        
+        1. 设置停止标志
+        2. 主动关闭底层 WebSocket 连接
+        3. 取消连接任务
+        4. 等待清理完成
+        """
+        logger.info("👋 Binance WebSocket 正在优雅关闭...")
         self._running = False
+        
+        # 主动关闭 WebSocket 连接，触发 recv() 立即抛出异常退出
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+                logger.debug("WebSocket 连接已关闭")
+            except Exception as e:
+                logger.debug(f"关闭 WebSocket 时出错（可忽略）: {e}")
+            finally:
+                self._ws = None
+        
+        # 取消连接任务
+        if hasattr(self, '_connect_task') and self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+            try:
+                await asyncio.wait_for(self._connect_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._connect_task = None
+        
+        logger.info("✅ Binance WebSocket 已关闭")
+    
+    def stop(self):
+        """
+        停止连接（同步版本 - 向后兼容）
+        
+        设置停止标志并关闭底层连接。
+        """
         logger.info("👋 Binance WebSocket 停止中...")
+        self._running = False
+        
+        # 关闭底层连接以中断阻塞的 recv()
+        if self._ws is not None:
+            try:
+                # 在有事件循环时使用 asyncio 关闭
+                loop = getattr(self, '_loop', None) or asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.call_soon_threadsafe(self._ws.close)
+                else:
+                    loop.run_until_complete(self._ws.close())
+            except Exception as e:
+                logger.debug(f"关闭 WebSocket 连接时出错（可忽略）: {e}")
+            finally:
+                self._ws = None
     
     def get_stats(self) -> Dict:
         """获取统计信息"""

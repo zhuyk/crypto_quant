@@ -1,120 +1,131 @@
 """
-结构化日志配置 - 生产环境
+统一日志配置 - 基于 loguru
+
+将 stdlib logging 和 loguru 统一：
+- 所有模块可使用 `from loguru import logger` 或 `logging.getLogger(__name__)`
+- stdlib logging 的输出会被自动拦截并路由到 loguru
+- 统一的格式化和文件输出
 """
 
 import logging
 import sys
-from datetime import datetime
+import os
 from typing import Optional
-import json
+from loguru import logger
 
 
-class JSONFormatter(logging.Formatter):
-    """JSON 格式日志"""
+class InterceptHandler(logging.Handler):
+    """
+    将 stdlib logging 拦截并转发到 loguru
     
-    def format(self, record: logging.LogRecord) -> str:
-        log_data = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-            "line": record.lineno,
-        }
-        
-        # 添加额外字段
-        if hasattr(record, 'user_id'):
-            log_data['user_id'] = record.user_id
-        if hasattr(record, 'request_id'):
-            log_data['request_id'] = record.request_id
-        if hasattr(record, 'symbol'):
-            log_data['symbol'] = record.symbol
-        
-        # 添加异常信息
-        if record.exc_info:
-            log_data['exception'] = self.formatException(record.exc_info)
-        
-        return json.dumps(log_data, ensure_ascii=False)
-
-
-class TradingFormatter(logging.Formatter):
-    """交易日志格式"""
+    这确保了无论模块使用 loguru 还是 stdlib logging，
+    日志都通过统一的 loguru pipeline 输出。
+    """
     
-    def format(self, record: logging.LogRecord) -> str:
-        # 交易相关日志特殊格式
-        if hasattr(record, 'trade_type'):
-            trade_log = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "type": "TRADE",
-                "trade_type": record.trade_type,
-                "symbol": getattr(record, 'symbol', ''),
-                "side": getattr(record, 'side', ''),
-                "price": getattr(record, 'price', 0),
-                "amount": getattr(record, 'amount', 0),
-                "pnl": getattr(record, 'pnl', 0),
-                "message": record.getMessage(),
-            }
-            return json.dumps(trade_log, ensure_ascii=False)
+    def emit(self, record: logging.LogRecord):
+        # 获取对应的 loguru 级别
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
         
-        return super().format(record)
+        # 找到调用者的帧（跳过 logging 和本拦截器的帧）
+        frame, depth = logging.currentframe(), 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+        
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
 
 
 def setup_logging(
     log_level: str = "INFO",
     log_file: Optional[str] = None,
-    log_format: str = "json",
-    service_name: str = "cryptoquant"
+    log_format: str = "text",
+    service_name: str = "cryptoquant",
 ):
     """
-    配置日志系统
+    配置统一日志系统
+    
+    - loguru 作为唯一的日志后端
+    - stdlib logging 通过 InterceptHandler 桥接到 loguru
+    - 支持 JSON / Text 格式切换
+    - 支持文件输出和日志轮转
     
     Args:
-        log_level: 日志级别
-        log_file: 日志文件路径
-        log_format: 日志格式 (json/text)
-        service_name: 服务名称
+        log_level: 日志级别 (DEBUG/INFO/WARNING/ERROR)
+        log_file: 日志文件路径（None 则不写文件）
+        log_format: "json" 使用结构化 JSON，"text" 使用可读文本
+        service_name: 服务名称标识
     """
-    # 根日志
-    root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper()))
+    # 1. 移除 loguru 默认 handler
+    logger.remove()
     
-    # 清除现有处理器
-    root_logger.handlers.clear()
-    
-    # 控制台处理器
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    
+    # 2. 配置 loguru 控制台输出
     if log_format == "json":
-        console_handler.setFormatter(JSONFormatter())
+        # JSON 结构化日志（适合生产环境 + ELK/Loki 等）
+        logger.add(
+            sys.stdout,
+            level=log_level.upper(),
+            format="{message}",
+            serialize=True,  # loguru 内置 JSON 序列化
+            colorize=False,
+        )
     else:
-        console_handler.setFormatter(TradingFormatter(
-            f'%(asctime)s [{service_name}] %(levelname)s %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
+        # 可读文本格式（适合开发环境）
+        logger.add(
+            sys.stdout,
+            level=log_level.upper(),
+            format=(
+                "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+                f"<cyan>{service_name}</cyan> | "
+                "<level>{level: <8}</level> | "
+                "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+                "<level>{message}</level>"
+            ),
+            colorize=True,
+        )
     
-    root_logger.addHandler(console_handler)
-    
-    # 文件处理器
+    # 3. 配置文件输出（带日志轮转）
     if log_file:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(JSONFormatter())
-        root_logger.addHandler(file_handler)
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        logger.add(
+            log_file,
+            level="DEBUG",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+            rotation="50 MB",       # 单文件最大 50MB
+            retention="7 days",     # 保留 7 天
+            compression="gz",       # 旧文件压缩
+            encoding="utf-8",
+            serialize=(log_format == "json"),
+        )
     
-    # 设置第三方库日志级别
-    logging.getLogger('uvicorn').setLevel(logging.WARNING)
-    logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
-    logging.getLogger('celery').setLevel(logging.INFO)
+    # 4. 拦截 stdlib logging -> loguru
+    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
     
-    # 创建服务日志
-    logger = logging.getLogger(service_name)
-    logger.info(f"{service_name} logging initialized", extra={'service': service_name})
+    # 5. 抑制第三方库过于啰嗦的日志
+    for noisy_logger in [
+        "uvicorn",
+        "uvicorn.access",
+        "uvicorn.error",
+        "sqlalchemy.engine",
+        "celery",
+        "websockets",
+        "httpx",
+        "httpcore",
+    ]:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     
-    return logger
+    logger.info(f"日志系统初始化完成 | service={service_name} level={log_level} format={log_format}")
 
 
-def get_logger(name: str) -> logging.Logger:
-    """获取日志记录器"""
-    return logging.getLogger(name)
+def get_logger(name: str):
+    """
+    获取日志记录器
+    
+    兼容接口：返回 loguru logger 的绑定实例。
+    使用方式: logger = get_logger(__name__)
+    """
+    return logger.bind(module=name)

@@ -2,6 +2,7 @@
 集成预测器 - 多模型融合
 """
 
+import time as _time
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import numpy as np
@@ -142,7 +143,7 @@ class EnsemblePredictor:
         
         result = EnsemblePrediction(
             symbol=symbol,
-            timestamp=int(np.time.time() * 1000),
+            timestamp=int(_time.time() * 1000),
             predicted_price=predicted_price,
             predicted_change=avg_change,
             confidence=confidence,
