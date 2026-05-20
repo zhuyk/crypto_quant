@@ -100,8 +100,11 @@ async def login(request: LoginRequest):
                 password='admin123456',
                 roles=['admin'],
             )
-            role_manager.assign_role(admin.id, Role.ADMIN)
-            logger.info("✅ 自动创建默认管理员账户")
+            if admin:
+                role_manager.assign_role(admin['id'], Role.ADMIN)
+                logger.info("✅ 自动创建默认管理员账户")
+            else:
+                logger.warning("⚠️  创建默认管理员账户失败")
     
     # 认证
     session_id = user_manager.authenticate(request.username, request.password)
