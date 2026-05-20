@@ -1,5 +1,8 @@
 /**
  * Pinia Store - 应用状态管理
+ * 
+ * 注意: Trading store 在 stores/trading.js 中独立定义，
+ * 避免命名冲突。
  */
 
 import { defineStore } from 'pinia'
@@ -47,52 +50,6 @@ export const useUserStore = defineStore('user', {
   },
 })
 
-export const useTradingStore = defineStore('trading', {
-  state: () => ({
-    positions: [],
-    recentTrades: [],
-    tickers: {},
-  }),
-  
-  getters: {
-    totalPositionValue: (state) => {
-      return state.positions.reduce((sum, pos) => {
-        return sum + (parseFloat(pos.size) * parseFloat(pos.currentPrice))
-      }, 0)
-    },
-    
-    totalUnrealizedPnl: (state) => {
-      return state.positions.reduce((sum, pos) => {
-        return sum + (parseFloat(pos.pnl) || 0)
-      }, 0)
-    },
-  },
-  
-  actions: {
-    async fetchPositions() {
-      try {
-        const data = await api.trader.positions()
-        this.positions = data.positions || []
-      } catch (error) {
-        console.error('加载持仓失败:', error)
-      }
-    },
-    
-    async fetchRecentTrades(limit = 20) {
-      try {
-        const data = await api.trader.statistics()
-        this.recentTrades = data.recent_trades || []
-      } catch (error) {
-        console.error('加载交易记录失败:', error)
-      }
-    },
-    
-    updateTicker(symbol, ticker) {
-      this.tickers[symbol] = ticker
-    },
-  },
-})
-
 export const useAccountStore = defineStore('account', {
   state: () => ({
     balances: {},
@@ -125,3 +82,6 @@ export const useAccountStore = defineStore('account', {
     },
   },
 })
+
+// 从 stores/trading.js 重新导出（确保导入路径统一）
+export { useTradingStore } from './trading'
