@@ -126,14 +126,44 @@ except Exception as e:
 
 # 手动注册策略 (确保可靠加载)
 try:
+    # --- 趋势策略 ---
     from strategies.trend.ma_cross import MACrossStrategy
     from strategies.trend.breakout import BreakoutStrategy
     from strategies.trend.macd import MACDStrategy
-    from strategies.composite import PortfolioStrategy, EnsembleStrategy, SectorRotationStrategy
     
     registry.register(MACrossStrategy)
     registry.register(BreakoutStrategy)
     registry.register(MACDStrategy)
+    
+    # --- 均值回归策略 ---
+    from strategies.mean_reversion.rsi_reversion import RSIReversionStrategy
+    from strategies.mean_reversion.bollinger_bands import BollingerBandsStrategy
+    
+    registry.register(RSIReversionStrategy)
+    registry.register(BollingerBandsStrategy)
+    
+    # --- 动量策略 ---
+    from strategies.momentum.dual_thrust import DualThrustStrategy
+    from strategies.momentum.kdj import KDJStrategy
+    
+    registry.register(DualThrustStrategy)
+    registry.register(KDJStrategy)
+    
+    # --- 波动率策略 ---
+    from strategies.volatility.atr_trailing import ATRTrailingStrategy
+    from strategies.volatility.grid_trading import GridTradingStrategy
+    
+    registry.register(ATRTrailingStrategy)
+    registry.register(GridTradingStrategy)
+    
+    # --- 做市策略 ---
+    from strategies.market_making.spread_market_maker import SpreadMarketMakerStrategy
+    
+    registry.register(SpreadMarketMakerStrategy)
+    
+    # --- 组合策略 ---
+    from strategies.composite import PortfolioStrategy, EnsembleStrategy, SectorRotationStrategy
+    
     registry.register(PortfolioStrategy)
     registry.register(EnsembleStrategy)
     registry.register(SectorRotationStrategy)
