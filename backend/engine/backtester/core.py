@@ -89,11 +89,16 @@ class Backtester:
         if not strategy.validate_data(data):
             raise ValueError("数据格式错误，缺少必要列")
         
+        # 预计算滑动窗口大小（取策略 slow_period 参数，默认 200 条足够所有指标）
+        _window = int(getattr(strategy, 'params', {}).get('slow_period', 200)) + 10
+
         # 主回测循环
         for i in range(len(data)):
             self.current_bar = i
             current_candle = data.iloc[i]
-            historical_data = data.iloc[:i+1]
+            # 只传固定窗口历史，避免 O(n²) 切片
+            window_start = max(0, i + 1 - _window)
+            historical_data = data.iloc[window_start:i+1]
             
             # 更新持仓的当前价格
             self._update_positions_price(current_candle)

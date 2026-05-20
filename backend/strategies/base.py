@@ -108,6 +108,9 @@ class Strategy(ABC):
     
     def __init__(self, params: Optional[Dict[str, Any]] = None):
         """初始化策略"""
+        # 确保 _positions 在任何 on_init 之前初始化
+        if self._positions is None:
+            self._positions = {}
         if params:
             self.params.update(params)
         self.on_init()
@@ -115,7 +118,8 @@ class Strategy(ABC):
     
     def on_init(self):
         """策略初始化回调"""
-        pass
+        if self._positions is None:
+            self._positions = {}
     
     @abstractmethod
     def generate_signal(self, data: pd.DataFrame) -> Optional[Signal]:

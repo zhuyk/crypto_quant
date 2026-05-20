@@ -147,12 +147,23 @@ async def download_data(request: DownloadRequest):
                 ccxt_symbol = symbol
                 storage_symbol = symbol
             
-            # 使用简单方式获取数据（最近 1000 条）
-            df = collector.fetch_klines(
-                symbol=ccxt_symbol,
-                timeframe=request.timeframe,
-                limit=1000,
-            )
+            # 根据时间范围分页获取数据
+            if request.start_time and request.end_time:
+                start_dt = datetime.fromtimestamp(request.start_time / 1000, tz=timezone.utc)
+                end_dt = datetime.fromtimestamp(request.end_time / 1000, tz=timezone.utc)
+                df = collector.fetch_klines_paginated(
+                    symbol=ccxt_symbol,
+                    timeframe=request.timeframe,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                )
+            else:
+                # 未指定时间范围，默认获取最近 1000 条
+                df = collector.fetch_klines(
+                    symbol=ccxt_symbol,
+                    timeframe=request.timeframe,
+                    limit=1000,
+                )
             
             if df.empty:
                 results.append({

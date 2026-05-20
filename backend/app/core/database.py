@@ -58,7 +58,7 @@ Base = declarative_base()
 @contextmanager
 def get_db() -> Generator:
     """
-    获取数据库会话（上下文管理器）
+    获取数据库会话（同步版本，上下文管理器）
     
     自动处理会话关闭和异常
     """
@@ -71,6 +71,29 @@ def get_db() -> Generator:
         raise
     finally:
         db.close()
+
+
+async def async_get_db():
+    """
+    异步获取数据库会话
+    
+    在 async 路由中使用 Depends(async_get_db)，
+    内部通过线程池执行同步 SQLAlchemy Session 操作。
+    """
+    import asyncio
+    from functools import partial
+    
+    db = SessionLocal()
+    try:
+        # 将同步操作封装为线程池调用
+        yield db
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Database session error: {e}")
+        raise
+    finally:
+        # 在线程池中执行 close，避免阻塞事件循环
+        await asyncio.get_event_loop().run_in_executor(None, db.close)
 
 
 def init_db():

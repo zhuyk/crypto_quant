@@ -86,6 +86,15 @@ class ParameterOptimizer:
                 result = {
                     "params": params,
                     "metric_value": getattr(report, self.metric, 0),
+                    "total_return": report.total_return,
+                    "annual_return": report.annual_return,
+                    "sharpe_ratio": report.sharpe_ratio,
+                    "max_drawdown": report.max_drawdown,
+                    "win_rate": report.win_rate,
+                    "profit_factor": report.profit_factor,
+                    "total_trades": report.total_trades,
+                    "winning_trades": report.winning_trades,
+                    "losing_trades": report.losing_trades,
                     "report": report,
                 }
                 self.results.append(result)
@@ -143,6 +152,15 @@ class ParameterOptimizer:
                 result = {
                     "params": params,
                     "metric_value": getattr(report, self.metric, 0),
+                    "total_return": report.total_return,
+                    "annual_return": report.annual_return,
+                    "sharpe_ratio": report.sharpe_ratio,
+                    "max_drawdown": report.max_drawdown,
+                    "win_rate": report.win_rate,
+                    "profit_factor": report.profit_factor,
+                    "total_trades": report.total_trades,
+                    "winning_trades": report.winning_trades,
+                    "losing_trades": report.losing_trades,
                     "report": report,
                 }
                 self.results.append(result)
@@ -231,6 +249,15 @@ class ParameterOptimizer:
                 result = {
                     "params": params,
                     "metric_value": getattr(report, self.metric, 0),
+                    "total_return": report.total_return,
+                    "annual_return": report.annual_return,
+                    "sharpe_ratio": report.sharpe_ratio,
+                    "max_drawdown": report.max_drawdown,
+                    "win_rate": report.win_rate,
+                    "profit_factor": report.profit_factor,
+                    "total_trades": report.total_trades,
+                    "winning_trades": report.winning_trades,
+                    "losing_trades": report.losing_trades,
                     "report": report,
                 }
                 self.results.append(result)

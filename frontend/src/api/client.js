@@ -107,6 +107,7 @@ export const api = {
     status: (taskId) => apiClient.get(`/backtest/status/${taskId}`),
     result: (taskId) => apiClient.get(`/backtest/result/${taskId}`),
     strategies: () => apiClient.get('/backtest/strategies'),
+    optimize: (data) => apiClient.post('/backtest/optimize', data),
   },
   
   // 账户

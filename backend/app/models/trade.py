@@ -1,7 +1,7 @@
 """
 交易相关模型
 """
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, func, Text, JSON
+from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, func, Text, JSON, BigInteger, Numeric
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -46,30 +46,68 @@ class StrategyInstance(Base):
 
 
 class BacktestRun(Base):
-    """回测运行记录表"""
+    """回测运行记录表（对齐实际数据库表结构）"""
     __tablename__ = "backtest_runs"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    strategy_name = Column(String(128), nullable=False)
-    symbol = Column(String(32), nullable=False)
-    timeframe = Column(String(16), nullable=False)
-    start_date = Column(DateTime, nullable=False)
-    end_date = Column(DateTime, nullable=False)
-    initial_capital = Column(Float, nullable=False, default=100000)
-    final_capital = Column(Float)
-    total_return = Column(Float)
-    sharpe_ratio = Column(Float)
-    max_drawdown = Column(Float)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    strategy_id = Column(Integer, nullable=True)  # 实际表中的字段
+    name = Column(String(128), nullable=False)   # 实际表用 name 而非 strategy_name
+    start_time = Column(BigInteger, nullable=False)  # 毫秒时间戳
+    end_time = Column(BigInteger, nullable=False)    # 毫秒时间戳
+    initial_capital = Column(Numeric(32, 16), nullable=False, default=100000)
+    final_capital = Column(Numeric(32, 16))
+    total_return = Column(Numeric(10, 4))
+    annual_return = Column(Numeric(10, 4))
+    sharpe_ratio = Column(Numeric(10, 4))
+    sortino_ratio = Column(Numeric(10, 4))
+    max_drawdown = Column(Numeric(10, 4))
+    win_rate = Column(Numeric(10, 4))
+    profit_factor = Column(Numeric(10, 4))
     total_trades = Column(Integer)
-    win_rate = Column(Float)
+    winning_trades = Column(Integer)
+    losing_trades = Column(Integer)
+    avg_win = Column(Numeric(32, 16))
+    avg_loss = Column(Numeric(32, 16))
     params = Column(JSON)
-    status = Column(String(32), default="pending")  # pending/running/completed/failed
-    error_message = Column(Text)
+    symbols = Column(JSON)  # 实际表中有此列
+    status = Column(String(16), default="pending")
+    equity_curve_path = Column(String(256))
     created_at = Column(DateTime, default=func.now())
     
+    # 方便访问的别名（兼容新代码）
+    @property
+    def strategy_name(self) -> str:
+        return self.name
+    
+    @property
+    def start_date(self):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(self.start_time / 1000, tz=timezone.utc) if self.start_time else None
+    
+    @property
+    def end_date(self):
+        from datetime import datetime, timezone
+        return datetime.fromtimestamp(self.end_time / 1000, tz=timezone.utc) if self.end_time else None
+    
+    @property
+    def symbol(self) -> str:
+        # symbols 是 JSON 列表，取第一个或返回空
+        if self.symbols:
+            import json
+            if isinstance(self.symbols, str):
+                s = json.loads(self.symbols)
+            else:
+                s = self.symbols
+            return s[0] if s else ""
+        return ""
+    
+    @property
+    def timeframe(self) -> str:
+        return ""  # 实际表中无此列
+    
     def __repr__(self):
-        return f"<BacktestRun(id={self.id}, strategy={self.strategy_name})>"
+        return f"<BacktestRun(id={self.id}, name={self.name})>"
 
 
 class Trade(Base):

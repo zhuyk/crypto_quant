@@ -71,6 +71,9 @@ coverage.xml
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# K-line data (too large, regenerate locally)
+backend/data/klines/
+
 # pyenv
 .python-version
 
