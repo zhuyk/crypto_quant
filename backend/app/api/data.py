@@ -1,238 +1,230 @@
 """
 历史数据管理 API
+
+改进:
+- 统一使用数据库存储 (废弃 JSON 文件)
+- 增量下载 + 断点续传
+- 异步非阻塞下载 (后台任务)
+- 正确的 symbol 解析 (支持 DOGE/MATIC 等 4+ 字符币种)
+- 下载进度跟踪
 """
 
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict
+import asyncio
 import logging
-import os
-import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+from app.core.config import settings
+from data.persistence.kline_storage import get_kline_storage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["data"])
 
+# 下载进度 (内存)
+_download_tasks: Dict[str, dict] = {}
 
-class SymbolData(BaseModel):
-    """交易对数据信息"""
-    symbol: str
-    timeframe: str
-    candle_count: int
-    start_time: int
-    end_time: int
-    size: int
-    updated_at: int
 
+# ============================================================
+# Models
+# ============================================================
 
 class DownloadRequest(BaseModel):
-    """下载请求"""
-    symbols: List[str]
-    timeframe: str
-    start_time: Optional[int] = None
-    end_time: Optional[int] = None
+    symbols: List[str] = Field(..., description="交易对列表")
+    timeframe: str = Field("1h", description="时间周期")
+    start_time: Optional[int] = Field(None, description="开始时间 (ms)")
+    end_time: Optional[int] = Field(None, description="结束时间 (ms)")
 
 
-@router.get("/symbols", response_model=List[SymbolData])
+# ============================================================
+# 工具
+# ============================================================
+
+def normalize_symbol(symbol: str) -> tuple:
+    """标准化 symbol → (ccxt_format, storage_format)"""
+    symbol = symbol.strip().upper()
+    if "/" in symbol:
+        return symbol, symbol.replace("/", "")
+    quotes = ["USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "BNB"]
+    for q in quotes:
+        if symbol.endswith(q) and len(symbol) > len(q):
+            return f"{symbol[:-len(q)]}/{q}", symbol
+    return symbol, symbol
+
+
+# ============================================================
+# 端点
+# ============================================================
+
+@router.get("/symbols")
 async def get_symbols():
-    """获取所有已下载的交易对数据"""
-    # 使用绝对路径
-    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    data_dir = os.path.join(base_dir, "data", "klines")
-    
-    if not os.path.exists(data_dir):
-        return []
-    
-    symbols = []
-    
-    # 遍历所有子目录（支持 BTC/USDT 这种嵌套结构）
-    for root, dirs, files in os.walk(data_dir):
-        for file in files:
-            if not file.endswith('.json'):
-                continue
-            
-            # 获取相对路径
-            rel_path = os.path.relpath(root, data_dir)
-            symbol = rel_path  # 例如：BTC/USDT 或 ETHUSDT
-            
-            timeframe = file.replace('.json', '')
-            file_path = os.path.join(root, file)
-            
-            try:
-                with open(file_path, 'r') as f:
-                    klines = json.load(f)
-                
-                if not klines:
-                    continue
-                
-                file_size = os.path.getsize(file_path)
-                start_time = min(k[0] for k in klines)
-                end_time = max(k[0] for k in klines)
-                mtime = os.path.getmtime(file_path)
-                
-                symbols.append(SymbolData(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    candle_count=len(klines),
-                    start_time=start_time,
-                    end_time=end_time,
-                    size=file_size,
-                    updated_at=int(mtime * 1000),
-                ))
-                
-            except Exception as e:
-                logger.error(f"读取数据失败 {file_path}: {e}")
-    
-    logger.info(f"📊 找到 {len(symbols)} 个已下载的交易对数据")
-    return symbols
+    """获取已存储的数据概览 (从数据库)"""
+    from app.core.database import SessionLocal
+    from app.models.trade import Kline
+    from sqlalchemy import func
+
+    db = SessionLocal()
+    try:
+        stats = db.query(
+            Kline.symbol, Kline.timeframe, Kline.exchange,
+            func.count(Kline.id).label("count"),
+            func.min(Kline.timestamp).label("earliest"),
+            func.max(Kline.timestamp).label("latest"),
+        ).group_by(Kline.symbol, Kline.timeframe, Kline.exchange).all()
+
+        return [
+            {
+                "symbol": r.symbol, "timeframe": r.timeframe, "exchange": r.exchange,
+                "candle_count": r.count,
+                "start_time": int(r.earliest.timestamp() * 1000) if r.earliest else None,
+                "end_time": int(r.latest.timestamp() * 1000) if r.latest else None,
+            }
+            for r in stats
+        ]
+    finally:
+        db.close()
 
 
 @router.get("/klines")
 async def get_klines(
-    symbol: str,
-    timeframe: str = Query(default="1h"),
-    limit: int = Query(default=1000, ge=1, le=10000),
+    symbol: str = Query(...),
+    timeframe: str = Query("1h"),
+    limit: int = Query(500, ge=1, le=5000),
+    start_time: Optional[int] = Query(None),
+    end_time: Optional[int] = Query(None),
 ):
-    """获取 K 线数据"""
-    file_path = f"data/klines/{symbol}/{timeframe}.json"
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="数据不存在")
-    
-    try:
-        with open(file_path, 'r') as f:
-            klines = json.load(f)
-        
-        # 返回最新的 limit 条数据
-        klines = klines[-limit:]
-        
-        # 转换为字典格式
-        result = [
-            {
-                "time": k[0],
-                "open": k[1],
-                "high": k[2],
-                "low": k[3],
-                "close": k[4],
-                "volume": k[5],
-            }
-            for k in klines
-        ]
-        
-        return {"klines": result}
-        
-    except Exception as e:
-        logger.error(f"读取 K 线数据失败 {file_path}: {e}")
-        raise HTTPException(status_code=500, detail="读取数据失败")
+    """获取 K 线数据 (从数据库)"""
+    storage = get_kline_storage()
+    _, stor_sym = normalize_symbol(symbol)
+    start_dt = datetime.fromtimestamp(start_time / 1000, tz=timezone.utc).replace(tzinfo=None) if start_time else None
+    end_dt = datetime.fromtimestamp(end_time / 1000, tz=timezone.utc).replace(tzinfo=None) if end_time else None
+
+    df = storage.get_klines(symbol=stor_sym, timeframe=timeframe, start_time=start_dt, end_time=end_dt, limit=limit)
+    if df.empty:
+        return {"klines": [], "count": 0}
+
+    klines = [
+        {"time": int(row.name.timestamp() * 1000), "open": row["open"], "high": row["high"],
+         "low": row["low"], "close": row["close"], "volume": row["volume"]}
+        for _, row in df.iterrows()
+    ]
+    return {"klines": klines, "count": len(klines)}
 
 
 @router.post("/download")
-async def download_data(request: DownloadRequest):
-    """下载历史数据"""
+async def download_data(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """下载历史数据 (后台异步, 增量续传)"""
+    task_id = f"{','.join(sorted(request.symbols))}:{request.timeframe}"
+
+    if task_id in _download_tasks and _download_tasks[task_id].get("status") == "running":
+        return {"success": False, "message": "任务正在运行", "task_id": task_id, "progress": _download_tasks[task_id]}
+
+    _download_tasks[task_id] = {
+        "status": "running", "symbols": request.symbols, "timeframe": request.timeframe,
+        "total_symbols": len(request.symbols), "completed_symbols": 0,
+        "total_records": 0, "errors": [],
+        "started_at": datetime.now(timezone.utc).isoformat(), "completed_at": None,
+    }
+
+    background_tasks.add_task(_bg_download, task_id, request.symbols, request.timeframe, request.start_time, request.end_time)
+    return {"success": True, "message": f"下载已启动 ({len(request.symbols)} 个交易对)", "task_id": task_id}
+
+
+@router.get("/download/status")
+async def get_download_status(task_id: Optional[str] = Query(None)):
+    """获取下载进度"""
+    if task_id:
+        return _download_tasks.get(task_id, {"status": "not_found"})
+    return {"tasks": _download_tasks}
+
+
+@router.get("/timeframes")
+async def get_timeframes():
+    """支持的时间周期"""
+    return {"timeframes": [
+        {"value": "1m", "label": "1 分钟"}, {"value": "5m", "label": "5 分钟"},
+        {"value": "15m", "label": "15 分钟"}, {"value": "30m", "label": "30 分钟"},
+        {"value": "1h", "label": "1 小时"}, {"value": "4h", "label": "4 小时"},
+        {"value": "1d", "label": "1 天"}, {"value": "1w", "label": "1 周"},
+    ]}
+
+
+@router.delete("/klines")
+async def delete_klines(symbol: str = Query(...), timeframe: str = Query(...)):
+    """删除指定数据"""
+    from app.core.database import SessionLocal
+    from app.models.trade import Kline
+    from sqlalchemy import and_
+
+    _, stor_sym = normalize_symbol(symbol)
+    db = SessionLocal()
+    try:
+        deleted = db.query(Kline).filter(and_(Kline.symbol == stor_sym, Kline.timeframe == timeframe)).delete(synchronize_session=False)
+        db.commit()
+        return {"success": True, "deleted_count": deleted}
+    finally:
+        db.close()
+
+
+# ============================================================
+# 后台下载
+# ============================================================
+
+async def _bg_download(task_id: str, symbols: List[str], timeframe: str, start_time, end_time):
+    """后台非阻塞下载"""
     from data.collector.binance_collector import BinanceCollector
-    from datetime import datetime, timezone
-    
+
+    storage = get_kline_storage()
     collector = BinanceCollector(testnet=False)
-    
-    results = []
-    
-    for symbol in request.symbols:
-        try:
-            # 统一格式：BTCUSDT → BTC/USDT，ETHUSDT → ETH/USDT
-            if '/' not in symbol and len(symbol) >= 6:
-                ccxt_symbol = f"{symbol[:3]}/{symbol[3:]}"  # BTCUSDT → BTC/USDT
-                storage_symbol = ccxt_symbol  # 存储也用 BTC/USDT 格式
-            else:
-                ccxt_symbol = symbol
-                storage_symbol = symbol
-            
-            # 根据时间范围分页获取数据
-            if request.start_time and request.end_time:
-                start_dt = datetime.fromtimestamp(request.start_time / 1000, tz=timezone.utc)
-                end_dt = datetime.fromtimestamp(request.end_time / 1000, tz=timezone.utc)
-                df = collector.fetch_klines_paginated(
-                    symbol=ccxt_symbol,
-                    timeframe=request.timeframe,
-                    start_time=start_dt,
-                    end_time=end_dt,
-                )
-            else:
-                # 未指定时间范围，默认获取最近 1000 条
-                df = collector.fetch_klines(
-                    symbol=ccxt_symbol,
-                    timeframe=request.timeframe,
-                    limit=1000,
-                )
-            
-            if df.empty:
-                results.append({
-                    "symbol": symbol,
-                    "success": False,
-                    "error": "未获取到数据",
-                })
-                continue
-            
-            # 转换为列表格式 [timestamp, open, high, low, close, volume]
-            klines = []
-            for idx, row in df.iterrows():
-                klines.append([
-                    int(idx.timestamp() * 1000),  # 毫秒时间戳
-                    float(row['open']),
-                    float(row['high']),
-                    float(row['low']),
-                    float(row['close']),
-                    float(row['volume']),
-                ])
-            
-            # 保存到文件（创建 BTC/USDT 这样的目录结构）
-            data_dir = f"data/klines/{storage_symbol}"
-            os.makedirs(data_dir, exist_ok=True)
-            
-            file_path = f"{data_dir}/{request.timeframe}.json"
-            
-            with open(file_path, 'w') as f:
-                json.dump(klines, f, indent=2)
-            
-            results.append({
-                "symbol": storage_symbol,
-                "success": True,
-                "count": len(klines),
-            })
-            
-            logger.info(f"✅ 下载 {storage_symbol} {request.timeframe} 共 {len(klines)} 条数据")
-            
-        except Exception as e:
-            logger.error(f"❌ 下载数据失败 {symbol}: {e}")
-            results.append({
-                "symbol": symbol,
-                "success": False,
-                "error": str(e),
-            })
-    
-    return {"results": results}
+    task = _download_tasks[task_id]
 
+    try:
+        for i, symbol in enumerate(symbols):
+            ccxt_sym, stor_sym = normalize_symbol(symbol)
+            try:
+                since = start_time
+                if not since:
+                    latest_ts = storage.get_latest_timestamp(stor_sym, timeframe)
+                    if latest_ts:
+                        since = int(latest_ts.replace(tzinfo=timezone.utc).timestamp() * 1000) + 1
 
-@router.delete("/symbols/{symbol}")
-async def delete_symbol_data(
-    symbol: str,
-    timeframe: Optional[str] = Query(default=None),
-):
-    """删除交易对数据"""
-    if timeframe:
-        # 删除特定时期的数据
-        file_path = f"data/klines/{symbol}/{timeframe}.json"
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return {"success": True, "message": f"已删除 {symbol} {timeframe} 数据"}
-        else:
-            raise HTTPException(status_code=404, detail="数据不存在")
-    else:
-        # 删除所有数据
-        symbol_path = f"data/klines/{symbol}"
-        if os.path.exists(symbol_path):
-            import shutil
-            shutil.rmtree(symbol_path)
-            return {"success": True, "message": f"已删除 {symbol} 所有数据"}
-        else:
-            raise HTTPException(status_code=404, detail="数据不存在")
+                end_ts = end_time or int(datetime.now(timezone.utc).timestamp() * 1000)
+                total_new = 0
+
+                for _ in range(500):
+                    try:
+                        df = collector.fetch_klines(symbol=ccxt_sym, timeframe=timeframe, limit=1000, since=since)
+                    except Exception as e:
+                        logger.warning(f"拉取失败 {ccxt_sym}: {e}")
+                        await asyncio.sleep(2)
+                        continue
+
+                    if df.empty:
+                        break
+
+                    new_count = storage.save_klines(symbol=stor_sym, timeframe=timeframe, data=df)
+                    total_new += new_count
+
+                    last_ts = df.index[-1]
+                    since = int(last_ts.timestamp() * 1000) + 1 if hasattr(last_ts, 'timestamp') else None
+                    if not since or since >= end_ts or len(df) < 1000:
+                        break
+
+                    await asyncio.sleep(0.15)
+
+                task["completed_symbols"] = i + 1
+                task["total_records"] += total_new
+
+            except Exception as e:
+                task["errors"].append({"symbol": symbol, "error": str(e)})
+
+            await asyncio.sleep(0.5)
+
+        task["status"] = "completed"
+        task["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+    except Exception as e:
+        task["status"] = "failed"
+        task["errors"].append({"error": str(e)})
