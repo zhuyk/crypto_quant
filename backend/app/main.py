@@ -21,6 +21,7 @@ from app.api.example import router as example_router
 from app.api.services import router as services_router
 from app.api.tasks import router as tasks_router
 from app.api.social import router as social_router
+from app.api.health import router as health_router
 from app.api.exchange_keys import router as exchange_keys_router
 from app.api.arbitrage import router as arbitrage_router
 from app.websocket import router as websocket_router
@@ -81,6 +82,16 @@ async def lifespan(app: FastAPI):
     # 关闭时清理
     logger.info("👋 CryptoQuant Backend 关闭中...")
     metrics.set_system_status("api", False)
+    
+    # 关闭 WebSocket 连接
+    try:
+        from app.services.binance_websocket import get_binance_ws
+        ws = get_binance_ws()
+        if ws:
+            await ws.stop_async()
+            logger.info("📡 Binance WebSocket 已优雅关闭")
+    except Exception as e:
+        logger.error(f"❌ WebSocket 关闭失败：{e}")
     
     # 关闭任务调度器
     try:
@@ -156,8 +167,12 @@ async def track_metrics(request: Request, call_next):
 
 @app.get("/health")
 async def health_check():
-    """健康检查"""
+    """健康检查 - 简单快速探测"""
     return {"status": "healthy", "version": "0.1.0"}
+
+
+# 注册详细健康检查路由 (/health/detailed, /health/ready, /health/live)
+app.include_router(health_router, prefix="/health")
 
 
 @app.get("/")

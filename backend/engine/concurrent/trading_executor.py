@@ -3,7 +3,6 @@
 支持多线程/异步并发执行交易订单
 """
 import asyncio
-import logging
 import time
 from typing import Dict, List, Optional, Any, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,8 +12,6 @@ from enum import Enum
 import threading
 
 from loguru import logger
-
-logger = logging.getLogger(__name__)
 
 
 class ExecutionStatus(Enum):

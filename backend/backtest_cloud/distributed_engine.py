@@ -3,6 +3,7 @@
 """
 
 import asyncio
+from collections import OrderedDict
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,51 @@ class BacktestTask:
             self.created_at = datetime.utcnow()
 
 
+class LRUCache:
+    """
+    带容量限制的 LRU 缓存
+    
+    当缓存达到最大容量时，自动驱逐最近最少使用的条目。
+    """
+    
+    def __init__(self, max_size: int = 500):
+        self._max_size = max_size
+        self._cache: OrderedDict = OrderedDict()
+        self._eviction_count = 0
+    
+    def get(self, key: str) -> Optional[dict]:
+        """获取缓存值，命中时移动到队尾(最近使用)"""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+    
+    def put(self, key: str, value):
+        """存入缓存，超出容量时驱逐最旧条目"""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self._cache[key] = value
+        else:
+            if len(self._cache) >= self._max_size:
+                evicted_key, _ = self._cache.popitem(last=False)
+                self._eviction_count += 1
+                logger.debug(f"缓存驱逐：{evicted_key} (总驱逐次数：{self._eviction_count})")
+            self._cache[key] = value
+    
+    def __contains__(self, key: str) -> bool:
+        return key in self._cache
+    
+    def __len__(self) -> int:
+        return len(self._cache)
+    
+    def clear(self):
+        self._cache.clear()
+    
+    @property
+    def eviction_count(self) -> int:
+        return self._eviction_count
+
+
 class DistributedBacktestEngine:
     """
     分布式回测引擎
@@ -49,14 +95,19 @@ class DistributedBacktestEngine:
         self,
         max_concurrent: int = 4,
         cache_enabled: bool = True,
+        max_cache_size: int = 500,
+        max_completed_tasks: int = 1000,
     ):
         """
         Args:
             max_concurrent: 最大并发数
             cache_enabled: 启用缓存
+            max_cache_size: 结果缓存最大条目数（LRU 驱逐）
+            max_completed_tasks: 已完成任务记录最大数量
         """
         self.max_concurrent = max_concurrent
         self.cache_enabled = cache_enabled
+        self._max_completed_tasks = max_completed_tasks
         
         # 任务队列
         self._task_queue = asyncio.Queue()
@@ -64,11 +115,11 @@ class DistributedBacktestEngine:
         # 运行中的任务
         self._running_tasks: Dict[str, BacktestTask] = {}
         
-        # 已完成任务
-        self._completed_tasks: Dict[str, BacktestTask] = {}
+        # 已完成任务（使用 LRU 缓存限制大小）
+        self._completed_tasks: LRUCache = LRUCache(max_size=max_completed_tasks)
         
-        # 结果缓存
-        self._result_cache: Dict[str, dict] = {}
+        # 结果缓存（使用 LRU 缓存限制大小）
+        self._result_cache: LRUCache = LRUCache(max_size=max_cache_size)
         
         # 工作节点
         self._workers = []
@@ -126,9 +177,9 @@ class DistributedBacktestEngine:
         if self.cache_enabled and task.id in self._result_cache:
             logger.info(f"使用缓存结果：{task.id}")
             task.status = "completed"
-            task.result = self._result_cache[task.id]
+            task.result = self._result_cache.get(task.id)
             task.completed_at = datetime.utcnow()
-            self._completed_tasks[task.id] = task
+            self._completed_tasks.put(task.id, task)
             return task.id
         
         # 添加到队列
@@ -162,8 +213,9 @@ class DistributedBacktestEngine:
     
     async def get_task_status(self, task_id: str) -> dict:
         """获取任务状态"""
-        if task_id in self._completed_tasks:
-            task = self._completed_tasks[task_id]
+        completed_task = self._completed_tasks.get(task_id)
+        if completed_task is not None:
+            task = completed_task
             return {
                 'id': task.id,
                 'status': task.status,
@@ -185,11 +237,13 @@ class DistributedBacktestEngine:
     
     async def get_result(self, task_id: str) -> Optional[dict]:
         """获取回测结果"""
-        if task_id in self._completed_tasks:
-            return self._completed_tasks[task_id].result
+        completed_task = self._completed_tasks.get(task_id)
+        if completed_task is not None:
+            return completed_task.result
         
-        if task_id in self._result_cache:
-            return self._result_cache[task_id]
+        cached = self._result_cache.get(task_id)
+        if cached is not None:
+            return cached
         
         return None
     
@@ -251,12 +305,12 @@ class DistributedBacktestEngine:
                     task.result = result
                     task.completed_at = datetime.utcnow()
                     
-                    # 缓存结果
+                    # 缓存结果（使用 LRU 缓存自动驱逐）
                     if self.cache_enabled:
-                        self._result_cache[task.id] = result
+                        self._result_cache.put(task.id, result)
                     
                     # 移动任务到已完成
-                    self._completed_tasks[task.id] = task
+                    self._completed_tasks.put(task.id, task)
                     self._running_tasks.pop(task.id, None)
                     
                     logger.info(f"Worker {worker_id} 完成任务：{task.id}")
@@ -282,6 +336,7 @@ class DistributedBacktestEngine:
             'running_tasks': len(self._running_tasks),
             'completed_tasks': len(self._completed_tasks),
             'cache_size': len(self._result_cache),
+            'cache_evictions': self._result_cache.eviction_count,
         }
     
     def clear_cache(self):

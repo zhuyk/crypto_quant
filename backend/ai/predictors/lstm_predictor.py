@@ -2,6 +2,7 @@
 LSTM 价格预测器
 """
 
+import time as _time
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -133,7 +134,7 @@ class LSTMPredictor:
             
             result = PredictionResult(
                 symbol=symbol,
-                timestamp=int(np.time.time() * 1000),
+                timestamp=int(_time.time() * 1000),
                 predicted_price=predicted_price,
                 predicted_change=predicted_change,
                 confidence=confidence,

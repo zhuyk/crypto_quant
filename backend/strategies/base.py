@@ -87,15 +87,10 @@ class Strategy(ABC):
     author: str = "CryptoQuant"
     description: str = "基础策略类"
     
-    # 支持的时间周期
+    # 注意：以下类属性不再使用可变默认值
+    # 每个实例在 __init__ 中初始化自己的副本
     timeframes: List[str] = None
-    
-    # 默认参数
     params: Dict[str, Any] = None
-    
-    # 策略状态
-    _initialized: bool = False
-    _positions: Dict[str, Position] = None
     
     def __post_init__(self):
         """数据类后处理"""
@@ -107,10 +102,21 @@ class Strategy(ABC):
             self._positions = {}
     
     def __init__(self, params: Optional[Dict[str, Any]] = None):
-        """初始化策略"""
-        # 确保 _positions 在任何 on_init 之前初始化
-        if self._positions is None:
-            self._positions = {}
+        """初始化策略 - 每个实例创建独立的可变数据副本"""
+        # 创建实例级别的副本，避免类级别的可变默认值共享
+        if self.__class__.params is not None:
+            self.params = dict(self.__class__.params)
+        else:
+            self.params = {}
+        
+        if self.__class__.timeframes is not None:
+            self.timeframes = list(self.__class__.timeframes)
+        else:
+            self.timeframes = ["1h", "4h", "1d"]
+        
+        self._positions: Dict[str, Position] = {}
+        self._initialized = False
+        
         if params:
             self.params.update(params)
         self.on_init()
@@ -118,8 +124,7 @@ class Strategy(ABC):
     
     def on_init(self):
         """策略初始化回调"""
-        if self._positions is None:
-            self._positions = {}
+        pass
     
     @abstractmethod
     def generate_signal(self, data: pd.DataFrame) -> Optional[Signal]:

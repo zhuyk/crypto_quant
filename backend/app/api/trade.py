@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 from loguru import logger
+import asyncio
 import time
 import uuid
 
@@ -15,6 +16,7 @@ from app.core.exceptions import (
     OrderError,
     InsufficientFundsError,
     ExternalAPIError,
+    NotFoundError,
     retry_on_exception,
     success_response,
 )
@@ -272,7 +274,7 @@ async def create_order(order: OrderRequest):
                 last_error = e
                 if attempt < max_retries - 1:
                     logger.warning(f"订单创建失败，重试 {attempt + 1}/{max_retries}: {str(e)}")
-                    time.sleep(1.0 * (attempt + 1))  # 递增延迟
+                    await asyncio.sleep(1.0 * (attempt + 1))  # 非阻塞递增延迟
                 else:
                     raise
         
@@ -415,7 +417,7 @@ async def close_position(symbol: str, amount: Optional[float] = None):
                 last_error = e
                 if attempt < max_retries - 1:
                     logger.warning(f"获取价格失败，重试 {attempt + 1}/{max_retries}: {str(e)}")
-                    time.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(0.5 * (attempt + 1))
         
         if not ticker or not ticker.get("last"):
             raise ExternalAPIError(
@@ -459,7 +461,7 @@ async def close_position(symbol: str, amount: Optional[float] = None):
                 "pnl_pct": pnl_pct,
                 "order_id": order_obj.id,
             },
-            message=f"平仓成功，盈亏：${pnl:.2f} ({pnl_pct:.2ff}%)"
+            message=f"平仓成功，盈亏：${pnl:.2f} ({pnl_pct:.2f}%)"
         )
         
     except (NotFoundError, OrderError, ExternalAPIError):
