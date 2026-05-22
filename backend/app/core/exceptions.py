@@ -1,9 +1,47 @@
 """
 异常处理模块
 自定义异常类和统一错误响应
+
+提供:
+- CryptoQuantException 基类及子类层次
+- 错误/成功响应格式化工具
+- 重试装饰器
 """
-from typing import Optional, Any, Dict
+from __future__ import annotations
+
+from typing import Optional, Any, Dict, Tuple, Type
 from fastapi import HTTPException, status
+
+__all__ = [
+    # 基类
+    "CryptoQuantException",
+    # 4xx 客户端错误
+    "ValidationError",
+    "AuthenticationError",
+    "AuthorizationError",
+    "NotFoundError",
+    "RateLimitError",
+    "ConflictError",
+    # 5xx 服务端错误
+    "DatabaseError",
+    "CacheError",
+    "ExternalAPIError",
+    "TradingError",
+    "InsufficientFundsError",
+    "OrderError",
+    "StrategyError",
+    "ConfigurationError",
+    # 工具函数
+    "handle_exception",
+    "error_response",
+    "success_response",
+    "ok",
+    "ok_list",
+    "fail",
+    "created",
+    "deleted",
+    "retry_on_exception",
+]
 
 
 class CryptoQuantException(Exception):
@@ -288,42 +326,18 @@ def handle_exception(exc: Exception) -> CryptoQuantException:
 
 
 # ============================================
-# 错误响应格式
+# 标准响应格式 (代理到 responses 模块)
 # ============================================
 
-def error_response(
-    error_code: str,
-    message: str,
-    status_code: int = 500,
-    details: Optional[Dict] = None,
-) -> Dict:
-    """
-    生成标准错误响应
-    
-    Returns:
-        错误响应字典
-    """
-    return {
-        "error": True,
-        "error_code": error_code,
-        "message": message,
-        "status_code": status_code,
-        "details": details or {},
-    }
-
-
-def success_response(data: Any = None, message: str = "success") -> Dict:
-    """
-    生成标准成功响应
-    
-    Returns:
-        成功响应字典
-    """
-    return {
-        "error": False,
-        "message": message,
-        "data": data,
-    }
+from app.core.responses import (
+    success_response,
+    error_response,
+    ok,
+    ok_list,
+    fail,
+    created,
+    deleted,
+)
 
 
 # ============================================
