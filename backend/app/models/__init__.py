@@ -10,6 +10,7 @@ from app.models.trade import (
     Position,
     Kline,
 )
+from app.models.reminder import Reminder
 
 __all__ = [
     "User",
@@ -20,4 +21,5 @@ __all__ = [
     "Trade",
     "Position",
     "Kline",
+    "Reminder",
 ]

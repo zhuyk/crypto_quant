@@ -23,6 +23,7 @@ from app.api.tasks import router as tasks_router
 from app.api.social import router as social_router
 from app.api.exchange_keys import router as exchange_keys_router
 from app.api.arbitrage import router as arbitrage_router
+from app.api.reminders import router as reminders_router
 from app.websocket import router as websocket_router
 from app.core.database import init_db
 from app.monitoring import get_metrics
@@ -129,6 +130,7 @@ app.include_router(exchanges_router, prefix="/api/v1/exchanges")
 app.include_router(marketplace_router, prefix="/api/v1/marketplace")
 app.include_router(exchange_keys_router)  # router 已包含 /api/v1/exchange-keys 前缀
 app.include_router(arbitrage_router)  # router 已包含 /api/v1/arbitrage 前缀
+app.include_router(reminders_router, prefix="/api/v1/reminders")
 app.include_router(websocket_router, prefix="/api/v1/ws")
 app.include_router(social_router, prefix="/api/v1")
 
