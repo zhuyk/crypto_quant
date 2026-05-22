@@ -1,5 +1,12 @@
 """
-向量化回测引擎核心
+向量化回测引擎核心 (重构版)
+
+修复:
+1. 资金计算 Bug (开仓扣除本金, 平仓返还本金+盈亏)
+2. 止损/止盈 reason 判断逻辑 (不再依赖 locals())
+3. 夏普比率动态适配 timeframe (非硬编码 24h)
+4. 仓位管理 (支持百分比仓位, 默认 95% 而非全仓)
+5. equity curve 正确估值空头持仓
 """
 import pandas as pd
 import numpy as np
@@ -12,6 +19,18 @@ from .report import BacktestReport
 
 logger = logging.getLogger(__name__)
 
+# 时间周期 → 每年包含的 bar 数 (用于年化计算)
+BARS_PER_YEAR = {
+    "1m": 365 * 24 * 60,
+    "5m": 365 * 24 * 12,
+    "15m": 365 * 24 * 4,
+    "30m": 365 * 24 * 2,
+    "1h": 365 * 24,
+    "4h": 365 * 6,
+    "1d": 365,
+    "1w": 52,
+}
+
 
 class Backtester:
     """
@@ -21,38 +40,42 @@ class Backtester:
     - 单策略回测
     - 多策略组合回测
     - 参数优化
-    - 多币种回测
+    - 可配置仓位比例
     """
     
     def __init__(
         self,
         initial_capital: float = 100000.0,
-        commission_rate: float = 0.001,  # 手续费 0.1%
-        slippage: float = 0.0005,  # 滑点 0.05%
-        leverage: float = 1.0,  # 杠杆倍数
+        commission_rate: float = 0.001,
+        slippage: float = 0.0005,
+        leverage: float = 1.0,
+        position_size_pct: float = 0.95,
+        timeframe: str = "1h",
     ):
         """
-        初始化回测引擎
-        
         Args:
             initial_capital: 初始资金
-            commission_rate: 手续费率
-            slippage: 滑点
+            commission_rate: 手续费率 (0.001 = 0.1%)
+            slippage: 滑点 (0.0005 = 0.05%)
             leverage: 杠杆倍数
+            position_size_pct: 仓位占可用资金比例 (0.95 = 95%)
+            timeframe: 数据时间周期 (用于年化计算)
         """
         self.initial_capital = initial_capital
         self.commission_rate = commission_rate
         self.slippage = slippage
         self.leverage = leverage
+        self.position_size_pct = position_size_pct
+        self.timeframe = timeframe
         
         # 回测状态
-        self.capital = initial_capital
+        self.capital = initial_capital      # 可用现金
         self.positions: Dict[str, Position] = {}
         self.trades: List[Dict[str, Any]] = []
-        self.equity_curve: List[Dict[str, Any]] = []
+        self.equity_curve: List[float] = []
         self.current_bar = 0
         
-        # 统计指标
+        # 统计
         self.total_trades = 0
         self.winning_trades = 0
         self.losing_trades = 0
@@ -65,71 +88,59 @@ class Backtester:
         data: pd.DataFrame,
         params: Optional[Dict[str, Any]] = None,
     ) -> BacktestReport:
-        """
-        执行回测
-        
-        Args:
-            strategy: 策略实例
-            data: K 线数据 (columns: open, high, low, close, volume, timestamp)
-            params: 策略参数
-        
-        Returns:
-            BacktestReport: 回测报告
-        """
-        # 重置状态
+        """执行回测"""
         self._reset()
         
-        # 设置策略参数
         if params:
             strategy.set_params(params)
         
-        logger.info(f"开始回测 - 策略：{strategy.name}, 数据条数：{len(data)}")
-        
-        # 验证数据
         if not strategy.validate_data(data):
             raise ValueError("数据格式错误，缺少必要列")
         
-        # 预计算滑动窗口大小（取策略 slow_period 参数，默认 200 条足够所有指标）
-        _window = int(getattr(strategy, 'params', {}).get('slow_period', 200)) + 10
-
+        logger.info(f"开始回测 - 策略：{strategy.name}, 数据：{len(data)} 条")
+        
+        # 滑动窗口大小
+        _window = int(strategy.params.get('slow_period', 200)) + 10
+        
         # 主回测循环
         for i in range(len(data)):
             self.current_bar = i
-            current_candle = data.iloc[i]
-            # 只传固定窗口历史，避免 O(n²) 切片
-            window_start = max(0, i + 1 - _window)
-            historical_data = data.iloc[window_start:i+1]
+            candle = data.iloc[i]
             
-            # 更新持仓的当前价格
-            self._update_positions_price(current_candle)
+            # 历史窗口 (避免 O(n²))
+            ws = max(0, i + 1 - _window)
+            hist = data.iloc[ws:i+1]
             
-            # 检查止损止盈
-            self._check_stop_loss_take_profit(current_candle)
+            # 1. 更新持仓价格
+            self._update_positions_price(candle)
             
-            # 生成信号
-            signal = strategy.generate_signal(historical_data)
+            # 2. 检查止损止盈
+            self._check_stop_loss_take_profit(candle)
             
-            # 执行交易
+            # 3. 生成信号
+            signal = strategy.generate_signal(hist)
+            
+            # 4. 执行交易
             if signal:
-                self._execute_signal(signal, current_candle)
+                self._execute_signal(signal, candle)
             
-            # 记录权益
-            self._record_equity(current_candle)
+            # 5. 记录权益
+            self._record_equity(candle)
             
-            # K 线更新回调
-            strategy.on_bar(current_candle)
+            # 6. K 线回调
+            strategy.on_bar(candle)
         
-        # 平仓所有持仓
+        # 结束时强制平仓
         self._close_all_positions(data.iloc[-1])
         
         # 生成报告
         report = self._generate_report(strategy)
-        logger.info(f"回测完成 - 总收益率：{report.total_return:.2%}, 夏普比率：{report.sharpe_ratio:.2f}")
+        logger.info(f"回测完成 - 收益率：{report.total_return:.2%}, 夏普：{report.sharpe_ratio:.2f}")
         
         return report
     
     def _reset(self):
-        """重置回测状态"""
+        """重置状态"""
         self.capital = self.initial_capital
         self.positions = {}
         self.trades = []
@@ -142,239 +153,271 @@ class Backtester:
         self.gross_loss = 0.0
     
     def _update_positions_price(self, candle: pd.Series):
-        """更新持仓的当前价格"""
-        for position in self.positions.values():
-            position.current_price = candle['close']
+        """更新持仓当前价格"""
+        for pos in self.positions.values():
+            pos.current_price = candle['close']
     
     def _check_stop_loss_take_profit(self, candle: pd.Series):
         """检查止损止盈"""
-        symbols_to_close = []
+        to_close = []
+        price = candle['close']
         
-        for symbol, position in self.positions.items():
-            should_close = False
-            close_price = candle['close']
+        for symbol, pos in self.positions.items():
+            reason = None
             
-            # 检查止损
-            if position.stop_loss:
-                if position.side == SignalSide.LONG and close_price <= position.stop_loss:
-                    should_close = True
-                elif position.side == SignalSide.SHORT and close_price >= position.stop_loss:
-                    should_close = True
+            # 止损检查
+            if pos.stop_loss:
+                if pos.side == SignalSide.LONG and price <= pos.stop_loss:
+                    reason = "stop_loss"
+                elif pos.side == SignalSide.SHORT and price >= pos.stop_loss:
+                    reason = "stop_loss"
             
-            # 检查止盈
-            if position.take_profit and not should_close:
-                if position.side == SignalSide.LONG and close_price >= position.take_profit:
-                    should_close = True
-                elif position.side == SignalSide.SHORT and close_price <= position.take_profit:
-                    should_close = True
+            # 止盈检查 (止损未触发时才检查止盈)
+            if reason is None and pos.take_profit:
+                if pos.side == SignalSide.LONG and price >= pos.take_profit:
+                    reason = "take_profit"
+                elif pos.side == SignalSide.SHORT and price <= pos.take_profit:
+                    reason = "take_profit"
             
-            if should_close:
-                symbols_to_close.append((symbol, close_price, 'stop_loss' if 'stop_loss' in locals() else 'take_profit'))
+            if reason:
+                to_close.append((symbol, price, reason))
         
-        # 执行平仓
-        for symbol, close_price, reason in symbols_to_close:
-            self._close_position(symbol, close_price, reason)
+        for symbol, price, reason in to_close:
+            self._close_position(symbol, price, reason)
     
     def _execute_signal(self, signal: Signal, candle: pd.Series):
         """执行交易信号"""
         symbol = signal.symbol
-        current_price = candle['close']
-        
-        # 应用滑点
-        if signal.side == SignalSide.LONG:
-            exec_price = current_price * (1 + self.slippage)
-        else:
-            exec_price = current_price * (1 - self.slippage)
+        price = candle['close']
         
         # 平仓信号
         if signal.side == SignalSide.CLOSE:
             if symbol in self.positions:
-                self._close_position(symbol, exec_price, 'signal')
+                exec_price = price * (1 - self.slippage) if self.positions[symbol].side == SignalSide.LONG else price * (1 + self.slippage)
+                self._close_position(symbol, exec_price, "signal")
             return
         
-        # 开仓信号
-        if symbol not in self.positions:
-            # 计算仓位大小 (简单版本：全仓)
-            position_value = self.capital * self.leverage
-            quantity = position_value / exec_price
-            
-            # 计算手续费
-            commission = position_value * self.commission_rate
-            
-            # 创建持仓
-            position = Position(
-                symbol=symbol,
-                side=signal.side,
-                quantity=quantity,
-                entry_price=exec_price,
-                current_price=exec_price,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
-            )
-            
-            self.positions[symbol] = position
-            self.capital -= commission  # 扣除手续费
-            
-            # 记录交易
-            self._record_trade(signal, exec_price, quantity, commission, 'open')
-            
-            # 回调
-            strategy = None  # 需要传入策略实例
-            if strategy:
-                strategy.on_position_opened(position)
+        # 已有持仓则忽略
+        if symbol in self.positions:
+            return
+        
+        # 计算执行价格 (含滑点)
+        if signal.side == SignalSide.LONG:
+            exec_price = price * (1 + self.slippage)
         else:
-            # 已有持仓，可能是加仓或反向信号
-            logger.debug(f"符号 {symbol} 已有持仓，忽略信号")
+            exec_price = price * (1 - self.slippage)
+        
+        # 计算仓位
+        available = self.capital * self.position_size_pct * self.leverage
+        if available <= 0:
+            return
+        
+        quantity = available / exec_price
+        position_cost = quantity * exec_price  # 持仓成本
+        commission = position_cost * self.commission_rate
+        
+        # 检查资金是否足够
+        total_cost = position_cost + commission
+        if total_cost > self.capital:
+            # 资金不足，缩小仓位
+            available = self.capital - commission
+            if available <= 0:
+                return
+            quantity = available / exec_price
+            position_cost = quantity * exec_price
+            commission = position_cost * self.commission_rate
+        
+        # 扣除本金 + 手续费 (核心修复: 开仓时扣除持仓成本)
+        self.capital -= (position_cost + commission)
+        
+        # 创建持仓
+        position = Position(
+            symbol=symbol,
+            side=signal.side,
+            quantity=quantity,
+            entry_price=exec_price,
+            current_price=exec_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+        )
+        self.positions[symbol] = position
+        
+        # 记录开仓交易
+        self.trades.append({
+            'symbol': symbol,
+            'side': signal.side.value,
+            'action': 'open',
+            'price': exec_price,
+            'quantity': quantity,
+            'value': position_cost,
+            'commission': commission,
+            'bar': self.current_bar,
+        })
     
     def _close_position(self, symbol: str, close_price: float, reason: str):
         """平仓"""
         if symbol not in self.positions:
             return
         
-        position = self.positions[symbol]
+        pos = self.positions[symbol]
         
-        # 计算盈亏
-        if position.side == SignalSide.LONG:
-            pnl = (close_price - position.entry_price) * position.quantity
-        else:
-            pnl = (position.entry_price - close_price) * position.quantity
-        
-        # 应用滑点
-        if position.side == SignalSide.LONG:
+        # 应用滑点到平仓价
+        if pos.side == SignalSide.LONG:
             exec_price = close_price * (1 - self.slippage)
         else:
             exec_price = close_price * (1 + self.slippage)
         
-        # 计算手续费
-        position_value = exec_price * position.quantity
-        commission = position_value * self.commission_rate
+        # 计算盈亏
+        if pos.side == SignalSide.LONG:
+            pnl = (exec_price - pos.entry_price) * pos.quantity
+        else:
+            pnl = (pos.entry_price - exec_price) * pos.quantity
         
-        # 更新资金
-        self.capital += pnl - commission
-        self.capital += position.entry_price * position.quantity  # 返还本金
+        # 平仓手续费
+        close_value = exec_price * pos.quantity
+        commission = close_value * self.commission_rate
+        
+        # 返还资金: 原始持仓成本 + 盈亏 - 平仓手续费
+        # (核心修复: 开仓时扣了 entry_price * quantity, 平仓时返回实际价值)
+        returned = pos.entry_price * pos.quantity + pnl - commission
+        self.capital += returned
         
         # 统计
+        net_pnl = pnl - commission  # 扣除平仓手续费的净盈亏
         self.total_trades += 1
-        if pnl > 0:
+        if net_pnl > 0:
             self.winning_trades += 1
-            self.gross_profit += pnl
+            self.gross_profit += net_pnl
         else:
             self.losing_trades += 1
-            self.gross_loss += abs(pnl)
+            self.gross_loss += abs(net_pnl)
         
-        # 记录交易
-        trade_record = {
+        # 记录平仓交易
+        self.trades.append({
             'symbol': symbol,
-            'side': position.side.value,
-            'entry_price': position.entry_price,
+            'side': pos.side.value,
+            'action': 'close',
+            'entry_price': pos.entry_price,
             'exit_price': exec_price,
-            'quantity': position.quantity,
-            'pnl': pnl,
-            'pnl_pct': pnl / (position.entry_price * position.quantity),
+            'quantity': pos.quantity,
+            'pnl': net_pnl,
+            'pnl_pct': net_pnl / (pos.entry_price * pos.quantity) if pos.entry_price > 0 else 0,
             'commission': commission,
-            'entry_bar': 0,  # TODO: 记录入场 bar
-            'exit_bar': self.current_bar,
+            'bar': self.current_bar,
             'exit_reason': reason,
-            'timestamp': datetime.now(),
-        }
-        self.trades.append(trade_record)
+        })
         
-        # 移除持仓
         del self.positions[symbol]
-        
-        logger.debug(f"平仓 {symbol}: 盈亏={pnl:.2f}, 原因={reason}")
     
     def _close_all_positions(self, last_candle: pd.Series):
-        """平仓所有持仓"""
+        """强制平仓所有持仓"""
         for symbol in list(self.positions.keys()):
             self._close_position(symbol, last_candle['close'], 'end_of_backtest')
     
     def _record_equity(self, candle: pd.Series):
-        """记录权益曲线"""
-        # 计算当前总权益
-        position_value = sum(
-            p.quantity * candle['close'] if p.side == SignalSide.LONG else p.quantity * p.entry_price
-            for p in self.positions.values()
-        )
-        total_equity = self.capital + position_value
+        """
+        记录权益曲线
         
-        self.equity_curve.append({
-            'bar': self.current_bar,
-            'timestamp': candle.get('timestamp', datetime.now()),
-            'capital': self.capital,
-            'position_value': position_value,
-            'total_equity': total_equity,
-        })
-    
-    def _record_trade(self, signal: Signal, price: float, quantity: float, commission: float, action: str):
-        """记录交易"""
-        trade_record = {
-            'symbol': signal.symbol,
-            'side': signal.side.value,
-            'action': action,
-            'price': price,
-            'quantity': quantity,
-            'commission': commission,
-            'bar': self.current_bar,
-            'timestamp': datetime.now(),
-        }
-        self.trades.append(trade_record)
+        总权益 = 可用现金 + 所有持仓的市值
+        (修复: 空头持仓正确计算浮动盈亏)
+        """
+        position_value = 0.0
+        price = candle['close']
+        
+        for pos in self.positions.values():
+            if pos.side == SignalSide.LONG:
+                # 多头: 市值 = 当前价 * 数量
+                position_value += price * pos.quantity
+            else:
+                # 空头: 市值 = 入场价 * 数量 + 浮动盈亏
+                # 浮动盈亏 = (entry - current) * quantity
+                unrealized_pnl = (pos.entry_price - price) * pos.quantity
+                position_value += pos.entry_price * pos.quantity + unrealized_pnl
+        
+        total_equity = self.capital + position_value
+        self.equity_curve.append(total_equity)
     
     def _generate_report(self, strategy: Strategy) -> BacktestReport:
         """生成回测报告"""
-        equity_series = pd.Series([e['total_equity'] for e in self.equity_curve])
+        equity = pd.Series(self.equity_curve)
         
-        # 计算收益率序列
-        returns = equity_series.pct_change().dropna()
+        if len(equity) < 2:
+            return self._empty_report(strategy)
+        
+        # 收益率序列
+        returns = equity.pct_change().dropna()
         
         # 总收益率
-        total_return = (equity_series.iloc[-1] - equity_series.iloc[0]) / equity_series.iloc[0]
+        total_return = (equity.iloc[-1] - equity.iloc[0]) / equity.iloc[0]
         
-        # 年化收益率 (假设 365 天)
-        days = len(equity_series) / 24  # 假设小时数据
-        annual_return = (1 + total_return) ** (365 / max(days, 1)) - 1
+        # 年化收益率 (根据实际 timeframe 动态计算)
+        bars_year = BARS_PER_YEAR.get(self.timeframe, 365 * 24)
+        n_bars = len(equity)
+        years = n_bars / bars_year
+        annual_return = (1 + total_return) ** (1 / max(years, 0.01)) - 1 if total_return > -1 else -1
         
-        # 夏普比率 (假设无风险利率为 0)
-        if returns.std() > 0:
-            sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252)  # 年化
+        # 夏普比率 (修复: 根据 timeframe 年化)
+        if returns.std() > 0 and len(returns) > 10:
+            sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(bars_year)
         else:
             sharpe_ratio = 0.0
         
         # 最大回撤
-        max_drawdown = self._calculate_max_drawdown(equity_series)
+        max_drawdown = self._calculate_max_drawdown(equity)
         
         # 胜率
         win_rate = self.winning_trades / max(self.total_trades, 1)
         
         # 盈亏比
-        if self.losing_trades > 0:
+        if self.gross_loss > 0:
             profit_factor = self.gross_profit / self.gross_loss
         else:
             profit_factor = float('inf') if self.gross_profit > 0 else 0.0
         
         # 平均盈亏
-        avg_trade_pnl = np.mean([t.get('pnl', 0) for t in self.trades if 'pnl' in t]) if self.trades else 0.0
+        close_trades = [t for t in self.trades if t.get('action') == 'close']
+        avg_pnl = np.mean([t['pnl'] for t in close_trades]) if close_trades else 0.0
         
         return BacktestReport(
             strategy_name=strategy.name,
             initial_capital=self.initial_capital,
-            final_capital=equity_series.iloc[-1],
+            final_capital=equity.iloc[-1],
             total_return=total_return,
             annual_return=annual_return,
             sharpe_ratio=sharpe_ratio,
             max_drawdown=max_drawdown,
             win_rate=win_rate,
-            profit_factor=profit_factor,
+            profit_factor=min(profit_factor, 999.99),
             total_trades=self.total_trades,
             winning_trades=self.winning_trades,
             losing_trades=self.losing_trades,
-            avg_trade_pnl=avg_trade_pnl,
-            equity_curve=equity_series.tolist(),
-            trades=self.trades,
+            avg_trade_pnl=avg_pnl,
+            equity_curve=equity.tolist(),
+            trades=close_trades,
         )
     
-    def _calculate_max_drawdown(self, equity_series: pd.Series) -> float:
+    def _calculate_max_drawdown(self, equity: pd.Series) -> float:
         """计算最大回撤"""
-        running_max = equity_series.expanding().max()
-        drawdown = (equity_series - running_max) / running_max
+        peak = equity.expanding().max()
+        drawdown = (equity - peak) / peak
         return abs(drawdown.min()) if len(drawdown) > 0 else 0.0
+    
+    def _empty_report(self, strategy: Strategy) -> BacktestReport:
+        """数据不足时返回空报告"""
+        return BacktestReport(
+            strategy_name=strategy.name,
+            initial_capital=self.initial_capital,
+            final_capital=self.initial_capital,
+            total_return=0.0,
+            annual_return=0.0,
+            sharpe_ratio=0.0,
+            max_drawdown=0.0,
+            win_rate=0.0,
+            profit_factor=0.0,
+            total_trades=0,
+            winning_trades=0,
+            losing_trades=0,
+            avg_trade_pnl=0.0,
+            equity_curve=[self.initial_capital],
+            trades=[],
+        )

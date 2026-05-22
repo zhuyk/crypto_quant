@@ -116,6 +116,7 @@ async def run_backtest(request: BacktestRequest, db: Session = Depends(async_get
             initial_capital=request.initial_capital,
             commission_rate=0.001,
             slippage=0.0005,
+            timeframe=request.timeframe,
         )
         
         # 执行回测
@@ -174,7 +175,7 @@ async def optimize_parameters(request: OptimizeRequest, background_tasks: Backgr
             raise HTTPException(status_code=404, detail="未找到数据")
         
         strategy_class = _get_strategy_class(request.strategy_name)
-        backtester = Backtester(initial_capital=100000.0)
+        backtester = Backtester(initial_capital=100000.0, timeframe=request.timeframe)
         
         optimizer = ParameterOptimizer(
             backtester=backtester,
@@ -918,7 +919,44 @@ async def _load_data(
     start_time: Optional[int] = None,
     end_time: Optional[int] = None,
 ) -> pd.DataFrame:
-    """加载 K 线数据，优先读本地文件，不存在时尝试从 5m 数据合成"""
+    """
+    加载 K 线数据
+    
+    优先级:
+    1. 数据库 (kline_storage) — 主数据源
+    2. 本地 JSON 文件 — 兼容旧数据
+    3. 从 5m 数据合成目标周期
+    4. 模拟数据 (最后手段)
+    """
+    from datetime import timezone as tz
+    
+    # --- 1. 优先从数据库读取 ---
+    try:
+        from data.persistence.kline_storage import get_kline_storage
+        storage = get_kline_storage()
+        
+        # 标准化 symbol (BTCUSDT / BTC/USDT → BTCUSDT)
+        stor_symbol = symbol.replace("/", "")
+        
+        start_dt = datetime.fromtimestamp(start_time / 1000, tz=tz.utc).replace(tzinfo=None) if start_time else None
+        end_dt = datetime.fromtimestamp(end_time / 1000, tz=tz.utc).replace(tzinfo=None) if end_time else None
+        
+        df = storage.get_klines(
+            symbol=stor_symbol,
+            timeframe=timeframe,
+            start_time=start_dt,
+            end_time=end_dt,
+            limit=50000,  # 回测允许更多数据
+        )
+        
+        if not df.empty:
+            df['symbol'] = symbol
+            logger.info(f"📊 从数据库加载 {symbol} {timeframe}: {len(df)} 条")
+            return df
+    except Exception as e:
+        logger.debug(f"数据库加载失败 (尝试文件): {e}")
+    
+    # --- 2. 尝试本地 JSON 文件 ---
     df = _read_klines_file(symbol, timeframe)
 
     if df.empty:
@@ -931,16 +969,18 @@ async def _load_data(
                 df = _resample_from_5m(df5m, timeframe)
                 logger.info(f"✅ 从 5m 合成 {timeframe} 数据 {len(df)} 条")
             else:
+                logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
                 return _generate_mock_data(symbol, timeframe)
         else:
+            logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
             return _generate_mock_data(symbol, timeframe)
 
     if start_time:
-        start_dt = pd.Timestamp(start_time, unit='ms', tz='UTC')
-        df = df[df.index >= start_dt]
+        start_dt_pd = pd.Timestamp(start_time, unit='ms', tz='UTC')
+        df = df[df.index >= start_dt_pd]
     if end_time:
-        end_dt = pd.Timestamp(end_time, unit='ms', tz='UTC')
-        df = df[df.index <= end_dt]
+        end_dt_pd = pd.Timestamp(end_time, unit='ms', tz='UTC')
+        df = df[df.index <= end_dt_pd]
 
     return df
 
