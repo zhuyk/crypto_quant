@@ -98,6 +98,11 @@ const router = createRouter({
 
 // 路由守卫
 router.beforeEach((to, from, next) => {
+  // 切换页面时取消所有未完成的 API 请求（防止 pending 堆积）
+  import('@/api/client').then(({ cancelPendingRequests }) => {
+    cancelPendingRequests()
+  })
+
   const isAuthenticated = localStorage.getItem('session_id')
   
   if (to.meta.requiresAuth && !isAuthenticated) {

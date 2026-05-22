@@ -1,22 +1,78 @@
 /**
  * API 客户端 - 统一 API 调用
+ * 
+ * 特性:
+ * - 路由切换时自动取消上一页面的未完成请求 (防止 pending 堆积)
+ * - 请求超时 10s (避免永久 pending)
+ * - 认证 token 自动注入
+ * - 统一错误处理
  */
 
 import axios from 'axios'
 
+// ============================================================
+// 请求取消管理器
+// 路由切换时调用 cancelPendingRequests() 清理所有未完成请求
+// ============================================================
+
+const pendingRequests = new Map()
+
+function getRequestKey(config) {
+  return `${config.method}:${config.url}`
+}
+
+function addPendingRequest(config) {
+  const key = getRequestKey(config)
+  if (!config.signal) {
+    const controller = new AbortController()
+    config.signal = controller.signal
+    pendingRequests.set(key, controller)
+  }
+}
+
+function removePendingRequest(config) {
+  const key = getRequestKey(config)
+  pendingRequests.delete(key)
+}
+
+/**
+ * 取消所有未完成的请求
+ * 在路由切换时调用此函数
+ */
+export function cancelPendingRequests() {
+  for (const [key, controller] of pendingRequests) {
+    controller.abort()
+  }
+  pendingRequests.clear()
+}
+
+
+// ============================================================
 // 创建 axios 实例
+// ============================================================
+
 const apiClient = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api/v1',
-  timeout: 30000,
+  timeout: 10000,  // 10 秒超时 (原来 30s 太长)
   headers: {
     'Content-Type': 'application/json',
   },
 })
 
-// 请求拦截器 - 添加认证
+// 请求拦截器
 apiClient.interceptors.request.use(
   (config) => {
-    // 从 localStorage 获取 token
+    // 取消同一接口的上一次未完成请求 (去重)
+    const key = getRequestKey(config)
+    if (pendingRequests.has(key)) {
+      pendingRequests.get(key).abort()
+      pendingRequests.delete(key)
+    }
+
+    // 注册新的取消控制器
+    addPendingRequest(config)
+
+    // 添加认证
     const token = localStorage.getItem('session_id')
     const apiKey = localStorage.getItem('api_key')
     
@@ -33,12 +89,24 @@ apiClient.interceptors.request.use(
   }
 )
 
-// 响应拦截器 - 处理错误
+// 响应拦截器
 apiClient.interceptors.response.use(
   (response) => {
+    // 请求完成，从 pending 列表移除
+    removePendingRequest(response.config)
     return response.data
   },
   (error) => {
+    // 请求失败也要移除
+    if (error.config) {
+      removePendingRequest(error.config)
+    }
+
+    // 被取消的请求静默处理 (不弹错误)
+    if (axios.isCancel(error) || error.code === 'ERR_CANCELED') {
+      return Promise.reject({ __canceled: true })
+    }
+
     if (error.response) {
       // 401 - 未授权
       if (error.response.status === 401) {
@@ -55,13 +123,18 @@ apiClient.interceptors.response.use(
       if (error.response.status === 500) {
         console.error('服务器错误')
       }
+    } else if (error.code === 'ECONNABORTED') {
+      console.warn('⏱️ 请求超时')
     }
     
     return Promise.reject(error)
   }
 )
 
+// ============================================================
 // API 方法封装
+// ============================================================
+
 export const api = {
   // 认证
   auth: {
@@ -143,7 +216,6 @@ export const api = {
   
   // 套利策略
   arbitrage: {
-    // 资金费率套利
     startFundingRateArbitrage: (config) => apiClient.post('/arbitrage/funding_rate/start', config),
     stopFundingRateArbitrage: (strategyId) => apiClient.post('/arbitrage/funding_rate/stop', { strategy_id: strategyId }),
     getFundingRateSignals: (minRate) => apiClient.get('/arbitrage/funding_rate/signals', { params: { min_rate: minRate } }),
