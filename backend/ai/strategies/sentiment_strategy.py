@@ -5,6 +5,7 @@
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 import numpy as np
+import time as _time
 import logging
 import re
 
@@ -263,7 +264,7 @@ class SentimentStrategy(MLStrategy):
             self._sentiment_history[symbol] = []
         
         data = SentimentData(
-            timestamp=int(np.time.time() * 1000),
+            timestamp=int(_time.time() * 1000),
             sentiment_score=sentiment_score,
             news_count=news_count,
             social_volume=social_volume,
@@ -278,9 +279,30 @@ class SentimentStrategy(MLStrategy):
             self._sentiment_history[symbol] = self._sentiment_history[symbol][-max_history:]
     
     def _online_learn(self, symbol: str, outcome: float):
-        """在线学习（简化实现）"""
-        # 实际应调整情绪阈值和权重
-        pass
+        """
+        在线学习 - 根据结果自适应调整阈值
+        
+        正收益 → 维持/强化当前模式参数
+        负收益 → 微调阈值，增加保守度
+        """
+        # 学习率
+        lr = 0.01
+        
+        if outcome > 0:
+            # 信号有效，略微降低阈值（更敏感）
+            current_threshold = self.model_config.get('sentiment_threshold', 0.5)
+            self.model_config['sentiment_threshold'] = max(0.2, current_threshold - lr)
+        elif outcome < -0.01:
+            # 信号失败，提高阈值（更保守）
+            current_threshold = self.model_config.get('sentiment_threshold', 0.5)
+            self.model_config['sentiment_threshold'] = min(0.9, current_threshold + lr)
+            
+            # 如果连续亏损，考虑切换策略模式
+            if self._total_signals > 10 and self._profitable_signals / self._total_signals < 0.4:
+                # 胜率过低，切换反向/趋势模式
+                current_mode = self.model_config.get('contrarian', True)
+                self.model_config['contrarian'] = not current_mode
+                logger.info(f"在线学习: 切换策略模式 contrarian={not current_mode}")
     
     def get_sentiment_trend(self, symbol: str, periods: int = 6) -> str:
         """

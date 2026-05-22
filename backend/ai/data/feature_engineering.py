@@ -3,6 +3,7 @@
 """
 
 import numpy as np
+import time as _time
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import logging
@@ -83,7 +84,7 @@ class FeatureEngineer:
         
         return FeatureSet(
             symbol=symbol,
-            timestamp=int(np.time.time() * 1000),
+            timestamp=int(_time.time() * 1000),
             features=features,
         )
     

@@ -1,16 +1,31 @@
 """
-交易 API 路由
+交易 API 路由 (已弃用 - 已整合到 trade.py)
+
+本模块的所有功能已合入 app.api.trade：
+- 策略信号执行 → POST /api/v1/trade/signal/execute
+- 交易员状态 → GET /api/v1/trade/service/status
+- 启动服务 → POST /api/v1/trade/service/start
+- 停止服务 → POST /api/v1/trade/service/stop
+- 交易统计 → GET /api/v1/trade/service/statistics
+
+保留此文件仅为向后兼容。新代码请使用 trade.py 中的统一接口。
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict
+from typing import Optional, List
 from decimal import Decimal
 import logging
+import warnings
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(tags=["trader"])
+router = APIRouter(tags=["trader (deprecated)"])
+
+# 弃用警告
+_DEPRECATION_NOTE = (
+    "此接口已弃用，请使用 /api/v1/trade/signal/execute 和 /api/v1/trade/service/* 替代"
+)
 
 
 class ExecuteSignalRequest(BaseModel):
@@ -58,205 +73,96 @@ class TraderStatusResponse(BaseModel):
     risk_level: str
 
 
-@router.post("/execute", response_model=OrderResponse)
+@router.post("/execute", response_model=OrderResponse, deprecated=True)
 async def execute_signal(request: ExecuteSignalRequest):
     """
-    执行交易信号
+    执行交易信号 [已弃用]
     
-    接收策略产生的交易信号，执行订单
+    请使用 POST /api/v1/trade/signal/execute
     """
-    from engine.trader.service import get_trader_service
+    logger.warning(f"使用了弃用接口 /trader/execute，请迁移到 /trade/signal/execute")
     
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
+    # 代理到新接口
+    from app.api.trade import execute_strategy_signal, ExecuteSignalRequest as NewRequest
     
-    try:
-        # 转换数量
-        quantity = Decimal(request.quantity) if request.quantity else None
-        price = Decimal(request.price) if request.price else None
-        stop_loss = Decimal(request.stop_loss) if request.stop_loss else None
-        take_profit = Decimal(request.take_profit) if request.take_profit else None
-        
-        # 执行信号
-        success = await service.execute_signal(
-            strategy_id=request.strategy_id,
-            symbol=request.symbol,
-            side=request.side,
-            quantity=quantity or Decimal('0'),
-            price=price,
-            order_type=request.order_type,
-            priority=request.priority,
-        )
-        
-        if success:
-            return OrderResponse(
-                success=True,
-                client_order_id=f"order_{request.strategy_id}_{request.symbol}",
-                message="信号执行成功",
-                state="submitted",
-                filled_quantity="0",
-                avg_fill_price="0",
-            )
-        else:
-            return OrderResponse(
-                success=False,
-                client_order_id=f"order_{request.strategy_id}_{request.symbol}",
-                message="信号执行失败（可能触发风控）",
-                state="rejected",
-                filled_quantity="0",
-                avg_fill_price="0",
-            )
-            
-    except Exception as e:
-        logger.error(f"执行信号失败：{e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    new_request = NewRequest(
+        strategy_id=request.strategy_id,
+        symbol=request.symbol,
+        side=request.side,
+        quantity=request.quantity,
+        signal_strength=request.signal_strength,
+        price=request.price,
+        order_type=request.order_type,
+        stop_loss=request.stop_loss,
+        take_profit=request.take_profit,
+        priority=request.priority,
+    )
+    
+    result = await execute_strategy_signal(new_request)
+    
+    return OrderResponse(
+        success=result.success,
+        order_id=result.order_id,
+        client_order_id=result.client_order_id,
+        message=result.message + f" ({_DEPRECATION_NOTE})",
+        state=result.state,
+        filled_quantity=result.filled_quantity,
+        avg_fill_price=result.avg_fill_price,
+    )
 
 
-@router.get("/status", response_model=TraderStatusResponse)
+@router.get("/status", response_model=TraderStatusResponse, deprecated=True)
 async def get_trader_status():
     """
-    获取交易员状态
+    获取交易员状态 [已弃用]
     
-    返回当前交易服务状态、持仓、风险等信息
+    请使用 GET /api/v1/trade/service/status
     """
-    from engine.trader.service import get_trader_service
+    logger.warning(f"使用了弃用接口 /trader/status，请迁移到 /trade/service/status")
     
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    status = service.get_full_status()
-    
-    # 计算总盈亏
-    initial = Decimal(status['initial_capital'])
-    current = Decimal(status['current_equity'])
-    total_pnl = current - initial
-    total_pnl_ratio = total_pnl / initial if initial != 0 else Decimal('0')
-    
-    return TraderStatusResponse(
-        is_running=status['is_running'],
-        current_equity=status['current_equity'],
-        initial_capital=status['initial_capital'],
-        total_pnl=str(total_pnl),
-        total_pnl_ratio=str(total_pnl_ratio),
-        positions=[
-            PositionInfo(
-                symbol=p['symbol'],
-                quantity=p['quantity'],
-                value=p['value'],
-            )
-            for p in status['positions']
-        ],
-        active_orders=status['order_statistics']['active_orders'],
-        risk_level=status['risk_status']['risk_level'],
-    )
-
-
-@router.get("/positions", response_model=List[PositionInfo])
-async def get_positions():
-    """获取当前持仓"""
-    from engine.trader.service import get_trader_service
-    
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    status = service.get_full_status()
-    
-    return [
-        PositionInfo(
-            symbol=p['symbol'],
-            quantity=p['quantity'],
-            value=p['value'],
+    try:
+        from engine.trader.service import get_trader_service
+        service = get_trader_service()
+        
+        if not service:
+            raise HTTPException(status_code=503, detail="交易服务未启动")
+        
+        status = service.get_full_status()
+        initial = Decimal(status['initial_capital'])
+        current = Decimal(status['current_equity'])
+        total_pnl = current - initial
+        total_pnl_ratio = total_pnl / initial if initial != 0 else Decimal('0')
+        
+        return TraderStatusResponse(
+            is_running=status['is_running'],
+            current_equity=status['current_equity'],
+            initial_capital=status['initial_capital'],
+            total_pnl=str(total_pnl),
+            total_pnl_ratio=str(total_pnl_ratio),
+            positions=[
+                PositionInfo(
+                    symbol=p['symbol'],
+                    quantity=p['quantity'],
+                    value=p['value'],
+                )
+                for p in status['positions']
+            ],
+            active_orders=status['order_statistics']['active_orders'],
+            risk_level=status['risk_status']['risk_level'],
         )
-        for p in status['positions']
-    ]
+    except ImportError:
+        raise HTTPException(status_code=503, detail="交易服务模块不可用")
 
 
-@router.get("/orders/active", response_model=List[dict])
-async def get_active_orders(symbol: Optional[str] = None):
-    """获取活跃订单"""
-    from engine.trader.service import get_trader_service
-    
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    orders = service.order_manager.get_active_orders(symbol=symbol)
-    return [order.to_dict() for order in orders]
-
-
-@router.post("/orders/{client_order_id}/cancel")
-async def cancel_order(client_order_id: str):
-    """取消订单"""
-    from engine.trader.service import get_trader_service
-    
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    success = await service.execution_engine.cancel_order(client_order_id)
-    
-    if success:
-        return {"success": True, "message": "订单已取消"}
-    else:
-        raise HTTPException(status_code=400, detail="取消订单失败")
-
-
-@router.get("/statistics")
-async def get_statistics():
-    """获取交易统计"""
-    from engine.trader.service import get_trader_service
-    
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    status = service.get_full_status()
-    
-    return {
-        "order_statistics": status['order_statistics'],
-        "execution_statistics": status['execution_statistics'],
-        "reconciliation_statistics": status['reconciliation_statistics'],
-        "slippage_statistics": status['slippage_statistics'],
-        "risk_status": status['risk_status'],
-        "strategy_statistics": service.strategy_runner.get_strategy_statistics(),
-    }
-
-
-@router.post("/start")
+@router.post("/start", deprecated=True)
 async def start_trader():
-    """启动交易服务"""
-    from engine.trader.service import get_trader_service, init_trader_service
-    from engine.risk.risk_manager import RiskManager
-    
-    service = get_trader_service()
-    if service and service._is_running:
-        return {"success": True, "message": "交易服务已在运行"}
-    
-    # 初始化交易服务
-    risk_manager = RiskManager(
-        initial_capital=100000,
-        max_drawdown=0.08,
-        max_daily_loss=0.02,
-    )
-    
-    service = init_trader_service(risk_manager=risk_manager)
-    await service.start()
-    
-    return {"success": True, "message": "交易服务已启动"}
+    """启动交易服务 [已弃用] - 请使用 POST /api/v1/trade/service/start"""
+    from app.api.trade import start_trading_service
+    return await start_trading_service()
 
 
-@router.post("/stop")
+@router.post("/stop", deprecated=True)
 async def stop_trader():
-    """停止交易服务"""
-    from engine.trader.service import get_trader_service
-    
-    service = get_trader_service()
-    if not service:
-        raise HTTPException(status_code=503, detail="交易服务未启动")
-    
-    await service.stop()
-    
-    return {"success": True, "message": "交易服务已停止"}
+    """停止交易服务 [已弃用] - 请使用 POST /api/v1/trade/service/stop"""
+    from app.api.trade import stop_trading_service
+    return await stop_trading_service()

@@ -1,10 +1,21 @@
 """
-实盘交易 API 路由
+实盘交易 API 路由（统一交易服务）
+
+整合功能:
+- 交易所连接和状态管理
+- 手动订单 (市价/限价/批量)
+- 策略信号自动执行
+- 仓位和风控管理
+- 交易服务生命周期 (启动/停止)
+- API 密钥管理
+- 并发订单执行
+
 增强错误处理、重试机制、并发执行
 """
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
+from decimal import Decimal
 from loguru import logger
 import asyncio
 import time
@@ -33,6 +44,7 @@ class TestConnectionRequest(BaseModel):
     exchange: str = "binance"
     api_key: str
     api_secret: str
+    passphrase: Optional[str] = None
     testnet: bool = True
 
 
@@ -41,25 +53,81 @@ async def test_connection(request: TestConnectionRequest):
     """
     测试 API 连接
     
-    验证 API Key 和 Secret 是否有效
+    真实调用交易所 API 验证 Key/Secret 有效性
     """
     try:
-        # TODO: 实际调用交易所 API 测试（需要代理）
-        # 现在先返回成功用于测试
-        logger.info(f"测试连接 - 交易所：{request.exchange}, 测试网：{request.testnet}")
+        from app.api.exchanges import (
+            create_authenticated_exchange,
+            SUPPORTED_EXCHANGES,
+        )
+        import ccxt
+        
+        if request.exchange not in SUPPORTED_EXCHANGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的交易所: {request.exchange}",
+            )
+        
+        logger.info(f"测试连接 - 交易所: {request.exchange}, 测试网: {request.testnet}")
+        
+        # 创建认证交易所实例
+        exchange = create_authenticated_exchange(
+            exchange_id=request.exchange,
+            api_key=request.api_key,
+            api_secret=request.api_secret,
+            passphrase=request.passphrase,
+            testnet=request.testnet,
+        )
+        
+        # 真实 API 调用测试
+        start_time = time.time()
+        balance = exchange.fetch_balance()
+        latency_ms = (time.time() - start_time) * 1000
+        
+        # 提取非零余额
+        non_zero = {
+            k: float(v) for k, v in balance.get('total', {}).items()
+            if v and float(v) > 0
+        }
         
         # 保存连接状态
         set_connected(request.exchange, request.testnet)
+        
+        logger.info(f"✅ 连接测试成功: {request.exchange} ({latency_ms:.0f}ms)")
         
         return {
             "success": True,
             "message": "连接成功",
             "exchange": request.exchange,
             "testnet": request.testnet,
+            "balance": non_zero or {"USDT": 0},
+            "latency_ms": round(latency_ms, 2),
         }
+        
+    except ccxt.AuthenticationError:
+        return {
+            "success": False,
+            "message": "认证失败: API Key 或 Secret 无效",
+            "exchange": request.exchange,
+            "testnet": request.testnet,
+        }
+    except ccxt.NetworkError as e:
+        return {
+            "success": False,
+            "message": f"网络错误: 无法连接到交易所 ({str(e)[:80]})",
+            "exchange": request.exchange,
+            "testnet": request.testnet,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.exception("测试连接失败")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"测试连接失败: {e}")
+        return {
+            "success": False,
+            "message": f"连接失败: {str(e)[:100]}",
+            "exchange": request.exchange,
+            "testnet": request.testnet,
+        }
 
 
 # ==================== 请求/响应模型 ====================
@@ -708,3 +776,372 @@ async def get_trade_statistics():
         "running_tasks": len(executor._futures),
         "success_rate": stats.get('completed', 0) / max(stats.get('total', 1), 1) * 100,
     }
+
+
+
+# ============================================================
+# 策略信号执行 (整合自 trader.py)
+# ============================================================
+
+class ExecuteSignalRequest(BaseModel):
+    """执行交易信号请求"""
+    strategy_id: str = Field(..., description="策略ID")
+    symbol: str = Field(..., description="交易对")
+    side: str = Field(..., description="买卖方向 (buy/sell)")
+    quantity: Optional[str] = Field(None, description="数量 (为空则根据资金自动计算)")
+    signal_strength: float = Field(default=1.0, ge=0, le=1, description="信号强度")
+    price: Optional[str] = Field(None, description="价格 (限价单)")
+    order_type: str = Field(default="market", description="订单类型 (market/limit)")
+    stop_loss: Optional[str] = Field(None, description="止损价格")
+    take_profit: Optional[str] = Field(None, description="止盈价格")
+    priority: bool = Field(default=False, description="是否优先执行")
+
+
+class SignalExecutionResponse(BaseModel):
+    """信号执行响应"""
+    success: bool
+    order_id: Optional[str] = None
+    client_order_id: str
+    message: str
+    state: str
+    strategy_id: str
+    symbol: str
+    filled_quantity: str = "0"
+    avg_fill_price: str = "0"
+
+
+@router.post("/signal/execute", response_model=SignalExecutionResponse)
+async def execute_strategy_signal(request: ExecuteSignalRequest):
+    """
+    执行策略信号
+    
+    接收策略产生的交易信号，经风控校验后执行订单。
+    这是策略系统到交易系统的桥梁。
+    
+    流程:
+    1. 验证策略和信号有效性
+    2. 风控检查（仓位限制、日损失限制等）
+    3. 计算下单量（如未指定）
+    4. 提交订单执行
+    """
+    engine = get_trading_engine()
+    pm = get_position_manager()
+    
+    if not engine:
+        raise TradingError("交易引擎未初始化", error_code="ENGINE_NOT_INITIALIZED")
+    
+    # 参数验证
+    if request.side not in ["buy", "sell"]:
+        raise OrderError("方向必须是 buy 或 sell", error_code="INVALID_SIDE")
+    
+    client_order_id = f"sig_{request.strategy_id}_{request.symbol}_{int(time.time())}"
+    
+    logger.info(
+        f"📡 策略信号: [{request.strategy_id}] {request.side.upper()} {request.symbol} "
+        f"强度={request.signal_strength}"
+    )
+    
+    try:
+        # 风控检查
+        if request.side == "buy":
+            can_open, reason = pm.can_open_position(
+                request.symbol, 
+                float(request.price) if request.price else 0
+            )
+            if not can_open:
+                logger.warning(f"⚠️ 风控拒绝信号: {reason}")
+                return SignalExecutionResponse(
+                    success=False,
+                    client_order_id=client_order_id,
+                    message=f"风控拒绝: {reason}",
+                    state="rejected",
+                    strategy_id=request.strategy_id,
+                    symbol=request.symbol,
+                )
+        
+        # 计算下单量
+        quantity = Decimal(request.quantity) if request.quantity else None
+        if not quantity:
+            # 根据信号强度和资金自动计算
+            portfolio = pm.get_portfolio_summary()
+            available = float(portfolio.get("available_capital", 0))
+            # 基础仓位 = 可用资金 * 5% * 信号强度
+            position_size = available * 0.05 * request.signal_strength
+            quantity = Decimal(str(max(position_size, 0)))
+        
+        price = Decimal(request.price) if request.price else None
+        
+        # 尝试通过 TraderService 执行 (如果存在)
+        try:
+            from engine.trader.service import get_trader_service
+            service = get_trader_service()
+            
+            if service and service._is_running:
+                success = await service.execute_signal(
+                    strategy_id=request.strategy_id,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=quantity,
+                    price=price,
+                    order_type=request.order_type,
+                    priority=request.priority,
+                )
+                
+                state = "submitted" if success else "rejected"
+                return SignalExecutionResponse(
+                    success=success,
+                    client_order_id=client_order_id,
+                    message="信号执行成功" if success else "信号执行失败",
+                    state=state,
+                    strategy_id=request.strategy_id,
+                    symbol=request.symbol,
+                )
+        except ImportError:
+            pass  # TraderService 不可用，回退到直接执行
+        
+        # 回退: 直接通过交易引擎执行
+        from engine.trader import OrderSide, OrderType
+        
+        order_obj = engine.create_order(
+            symbol=request.symbol,
+            side=OrderSide(request.side),
+            amount=float(quantity),
+            order_type=OrderType(request.order_type),
+            price=float(price) if price else None,
+            stop_loss=float(request.stop_loss) if request.stop_loss else None,
+            take_profit=float(request.take_profit) if request.take_profit else None,
+        )
+        
+        if order_obj:
+            # 更新仓位
+            if request.side == "buy":
+                pm.add_position(
+                    symbol=request.symbol,
+                    side=request.side,
+                    amount=float(quantity),
+                    entry_price=float(price or order_obj.filled_price),
+                    stop_loss=float(request.stop_loss) if request.stop_loss else None,
+                    take_profit=float(request.take_profit) if request.take_profit else None,
+                )
+            
+            return SignalExecutionResponse(
+                success=True,
+                order_id=order_obj.id,
+                client_order_id=client_order_id,
+                message="信号执行成功 (直接执行)",
+                state="submitted",
+                strategy_id=request.strategy_id,
+                symbol=request.symbol,
+                filled_quantity=str(order_obj.filled_amount),
+                avg_fill_price=str(order_obj.filled_price),
+            )
+        else:
+            return SignalExecutionResponse(
+                success=False,
+                client_order_id=client_order_id,
+                message="订单创建失败",
+                state="rejected",
+                strategy_id=request.strategy_id,
+                symbol=request.symbol,
+            )
+    
+    except (TradingError, OrderError):
+        raise
+    except Exception as e:
+        logger.error(f"执行策略信号异常: {e}")
+        return SignalExecutionResponse(
+            success=False,
+            client_order_id=client_order_id,
+            message=f"执行异常: {str(e)}",
+            state="error",
+            strategy_id=request.strategy_id,
+            symbol=request.symbol,
+        )
+
+
+# ============================================================
+# 交易服务生命周期管理 (整合自 trader.py)
+# ============================================================
+
+class ServiceStatusResponse(BaseModel):
+    """交易服务状态"""
+    is_running: bool
+    exchange: Optional[str] = None
+    testnet: Optional[bool] = None
+    current_equity: Optional[str] = None
+    initial_capital: str
+    total_pnl: Optional[str] = None
+    total_pnl_ratio: Optional[str] = None
+    active_orders: int = 0
+    open_positions: int = 0
+    risk_level: str = "normal"
+
+
+@router.get("/service/status", response_model=ServiceStatusResponse)
+async def get_service_status():
+    """
+    获取交易服务综合状态
+    
+    整合交易引擎、仓位管理、风控的全面信息
+    """
+    connected = is_connected()
+    pm = get_position_manager()
+    
+    # 尝试获取 TraderService 状态
+    try:
+        from engine.trader.service import get_trader_service
+        service = get_trader_service()
+        
+        if service and service._is_running:
+            status = service.get_full_status()
+            initial = Decimal(status['initial_capital'])
+            current = Decimal(status['current_equity'])
+            total_pnl = current - initial
+            total_pnl_ratio = total_pnl / initial if initial != 0 else Decimal('0')
+            
+            return ServiceStatusResponse(
+                is_running=True,
+                exchange="binance" if connected else None,
+                testnet=True if connected else None,
+                current_equity=status['current_equity'],
+                initial_capital=status['initial_capital'],
+                total_pnl=str(total_pnl),
+                total_pnl_ratio=str(total_pnl_ratio),
+                active_orders=status['order_statistics']['active_orders'],
+                open_positions=len(status['positions']),
+                risk_level=status['risk_status']['risk_level'],
+            )
+    except (ImportError, Exception):
+        pass
+    
+    # 回退: 从仓位管理器获取状态
+    portfolio = pm.get_portfolio_summary()
+    
+    return ServiceStatusResponse(
+        is_running=connected,
+        exchange="binance" if connected else None,
+        testnet=True if connected else None,
+        initial_capital=str(settings.DEFAULT_INITIAL_CAPITAL),
+        open_positions=portfolio.get("open_positions", 0),
+        risk_level="normal",
+    )
+
+
+@router.post("/service/start")
+async def start_trading_service():
+    """
+    启动交易服务
+    
+    初始化交易引擎、风控管理器，开始接受策略信号
+    """
+    try:
+        from engine.trader.service import get_trader_service, init_trader_service
+        from engine.risk.risk_manager import RiskManager
+        
+        service = get_trader_service()
+        if service and service._is_running:
+            return {"success": True, "message": "交易服务已在运行", "status": "running"}
+        
+        # 初始化风控
+        risk_manager = RiskManager(
+            initial_capital=settings.DEFAULT_INITIAL_CAPITAL,
+            max_drawdown=settings.MAX_DRAWDOWN,
+            max_daily_loss=settings.MAX_DAILY_LOSS,
+        )
+        
+        # 初始化并启动服务
+        service = init_trader_service(risk_manager=risk_manager)
+        await service.start()
+        
+        logger.info("✅ 交易服务已启动")
+        
+        return {
+            "success": True,
+            "message": "交易服务已启动",
+            "status": "running",
+            "config": {
+                "initial_capital": settings.DEFAULT_INITIAL_CAPITAL,
+                "max_drawdown": settings.MAX_DRAWDOWN,
+                "max_daily_loss": settings.MAX_DAILY_LOSS,
+            },
+        }
+        
+    except ImportError as e:
+        # TraderService 模块不可用，使用基础模式
+        logger.warning(f"TraderService 不可用，使用基础交易模式: {e}")
+        set_connected("binance", True)
+        return {
+            "success": True,
+            "message": "交易服务已启动 (基础模式)",
+            "status": "running_basic",
+        }
+    except Exception as e:
+        logger.error(f"启动交易服务失败: {e}")
+        raise TradingError(f"启动失败: {str(e)}", error_code="SERVICE_START_FAILED")
+
+
+@router.post("/service/stop")
+async def stop_trading_service():
+    """
+    停止交易服务
+    
+    优雅关闭：取消挂单、停止信号接收、保存状态
+    """
+    try:
+        from engine.trader.service import get_trader_service
+        
+        service = get_trader_service()
+        if service and service._is_running:
+            await service.stop()
+            logger.info("⏹️ 交易服务已停止")
+            set_disconnected()
+            return {"success": True, "message": "交易服务已停止", "status": "stopped"}
+        
+    except ImportError:
+        pass
+    
+    # 基础模式下停止
+    set_disconnected()
+    return {"success": True, "message": "交易服务已停止", "status": "stopped"}
+
+
+@router.get("/service/statistics")
+async def get_service_statistics():
+    """
+    获取交易服务详细统计
+    
+    包含订单统计、执行统计、对账统计、滑点统计、风控状态等
+    """
+    # 执行器统计
+    executor = get_trading_executor()
+    executor_stats = executor.get_stats()
+    
+    result = {
+        "executor": executor_stats,
+        "running_tasks": len(executor._futures),
+    }
+    
+    # 尝试获取 TraderService 详细统计
+    try:
+        from engine.trader.service import get_trader_service
+        service = get_trader_service()
+        
+        if service:
+            status = service.get_full_status()
+            result.update({
+                "order_statistics": status.get('order_statistics', {}),
+                "execution_statistics": status.get('execution_statistics', {}),
+                "reconciliation_statistics": status.get('reconciliation_statistics', {}),
+                "slippage_statistics": status.get('slippage_statistics', {}),
+                "risk_status": status.get('risk_status', {}),
+            })
+            
+            # 策略统计
+            try:
+                result["strategy_statistics"] = service.strategy_runner.get_strategy_statistics()
+            except Exception:
+                pass
+    except (ImportError, Exception):
+        pass
+    
+    return result

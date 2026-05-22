@@ -168,6 +168,12 @@ try:
     registry.register(EnsembleStrategy)
     registry.register(SectorRotationStrategy)
     
+    # --- AI 策略 (通过适配器接入) ---
+    from ai.strategy_adapter import SentimentStrategyAdapter, EnsemblePredictorAdapter
+    
+    registry.register(SentimentStrategyAdapter)
+    registry.register(EnsemblePredictorAdapter)
+    
     logger.info(f"策略手动注册完成，共 {len(registry.list_all())} 个策略")
 except Exception as e:
     logger.warning(f"策略手动注册失败：{e}")

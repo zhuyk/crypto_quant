@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.database import async_get_db
 from app.models.trade import BacktestRun
 from strategies.base import Strategy
+from strategies.registry import registry, get_strategy_class as registry_get_strategy
 from strategies.trend.ma_cross import MACrossStrategy
 from strategies.trend.breakout import BreakoutStrategy
 from strategies.trend.macd import MACDStrategy
@@ -1019,7 +1020,13 @@ def _create_strategy(strategy_name: str, params: Dict[str, Any]) -> Strategy:
 
 
 def _get_strategy_class(strategy_name: str) -> type:
-    """获取策略类"""
+    """获取策略类 - 优先从注册表查找"""
+    # 先从全局注册表获取（包含所有已注册策略）
+    strategy_class = registry_get_strategy(strategy_name)
+    if strategy_class:
+        return strategy_class
+    
+    # 兜底：硬编码映射（兼容旧代码）
     strategies = {
         "ma_cross": MACrossStrategy,
         "breakout": BreakoutStrategy,
@@ -1032,6 +1039,7 @@ def _get_strategy_class(strategy_name: str) -> type:
     }
     
     if strategy_name not in strategies:
-        raise ValueError(f"不支持的策略：{strategy_name}")
+        available = list(registry.list_all().keys()) or list(strategies.keys())
+        raise ValueError(f"不支持的策略：{strategy_name}。可用策略: {available}")
     
     return strategies[strategy_name]
