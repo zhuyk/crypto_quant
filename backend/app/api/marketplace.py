@@ -4,7 +4,7 @@
 
 from fastapi import APIRouter, HTTPException
 from app.core.database import SessionLocal
-from app.models.strategy import Strategy
+from app.models.trade import Strategy
 
 router = APIRouter(tags=["策略市场"])
 
