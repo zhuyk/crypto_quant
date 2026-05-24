@@ -153,16 +153,27 @@ class Backtester:
         self.gross_loss = 0.0
     
     def _update_positions_price(self, candle: pd.Series):
-        """更新持仓当前价格"""
+        """更新持仓当前价格（按各持仓 symbol 匹配）"""
+        price = candle['close']
+        candle_symbol = candle.get('symbol', None)
+        
         for pos in self.positions.values():
-            pos.current_price = candle['close']
+            # 如果 candle 有 symbol 信息，只更新匹配的持仓
+            # 如果没有 symbol 信息（单币种回测），更新所有
+            if candle_symbol is None or pos.symbol == candle_symbol:
+                pos.current_price = price
     
     def _check_stop_loss_take_profit(self, candle: pd.Series):
         """检查止损止盈"""
         to_close = []
         price = candle['close']
+        candle_symbol = candle.get('symbol', None)
         
         for symbol, pos in self.positions.items():
+            # 多币种回测时，只检查当前 candle 对应的持仓
+            if candle_symbol is not None and pos.symbol != candle_symbol:
+                continue
+            
             reason = None
             
             # 止损检查

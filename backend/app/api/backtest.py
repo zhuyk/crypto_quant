@@ -22,12 +22,6 @@ from app.core.database import async_get_db
 from app.models.trade import BacktestRun
 from strategies.base import Strategy
 from strategies.registry import registry, get_strategy_class as registry_get_strategy
-from strategies.trend.ma_cross import MACrossStrategy
-from strategies.trend.breakout import BreakoutStrategy
-from strategies.trend.macd import MACDStrategy
-from strategies.trend.bollinger import BollingerStrategy
-from strategies.trend.turtle import TurtleStrategy
-from strategies.composite import PortfolioStrategy, EnsembleStrategy, SectorRotationStrategy
 from engine.backtester import Backtester, ParameterOptimizer
 
 logger = logging.getLogger(__name__)
@@ -54,7 +48,8 @@ class BacktestResponse(BaseModel):
     """回测响应"""
     success: bool
     report: Optional[Dict[str, Any]] = None
-    backtest_id: Optional[int] = None  # 新增：回测记录 ID
+    backtest_id: Optional[int] = None
+    warning: Optional[str] = None  # 数据来源警告
     error: Optional[str] = None
 
 
@@ -143,10 +138,21 @@ async def run_backtest(request: BacktestRequest, db: Session = Depends(async_get
         
         logger.info(f"✅ 回测保存成功 [id={backtest_id}] {request.strategy_name} {request.symbol}")
         
+        # 标注数据来源
+        data_source = getattr(data, 'attrs', {}).get('_data_source', 'unknown')
+        report_dict['data_source'] = data_source
+        report_dict['data_points'] = len(data)
+        
+        # 如果使用了模拟数据，在响应中明确警告
+        warning = None
+        if data_source == 'mock':
+            warning = "⚠️ 本次回测使用模拟随机数据，结果仅供参考，不代表真实市场表现"
+        
         return BacktestResponse(
             success=True,
             report=report_dict,
             backtest_id=backtest_id,
+            warning=warning,
         )
         
     except HTTPException:
@@ -927,7 +933,7 @@ async def _load_data(
     1. 数据库 (kline_storage) — 主数据源
     2. 本地 JSON 文件 — 兼容旧数据
     3. 从 5m 数据合成目标周期
-    4. 模拟数据 (最后手段)
+    4. 模拟数据 (最后手段, 在 DataFrame 中标记 _data_source)
     """
     from datetime import timezone as tz
     
@@ -952,6 +958,7 @@ async def _load_data(
         
         if not df.empty:
             df['symbol'] = symbol
+            df.attrs['_data_source'] = 'database'
             logger.info(f"📊 从数据库加载 {symbol} {timeframe}: {len(df)} 条")
             return df
     except Exception as e:
@@ -968,13 +975,20 @@ async def _load_data(
             df5m = _read_klines_file(symbol, "5m")
             if not df5m.empty:
                 df = _resample_from_5m(df5m, timeframe)
+                df.attrs['_data_source'] = 'resampled_5m'
                 logger.info(f"✅ 从 5m 合成 {timeframe} 数据 {len(df)} 条")
             else:
                 logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
-                return _generate_mock_data(symbol, timeframe)
+                mock_df = _generate_mock_data(symbol, timeframe)
+                mock_df.attrs['_data_source'] = 'mock'
+                return mock_df
         else:
             logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
-            return _generate_mock_data(symbol, timeframe)
+            mock_df = _generate_mock_data(symbol, timeframe)
+            mock_df.attrs['_data_source'] = 'mock'
+            return mock_df
+    else:
+        df.attrs['_data_source'] = 'json_file'
 
     if start_time:
         start_dt_pd = pd.Timestamp(start_time, unit='ms', tz='UTC')
@@ -1020,26 +1034,14 @@ def _create_strategy(strategy_name: str, params: Dict[str, Any]) -> Strategy:
 
 
 def _get_strategy_class(strategy_name: str) -> type:
-    """获取策略类 - 优先从注册表查找"""
-    # 先从全局注册表获取（包含所有已注册策略）
+    """获取策略类 - 统一使用策略注册表"""
     strategy_class = registry_get_strategy(strategy_name)
     if strategy_class:
         return strategy_class
     
-    # 兜底：硬编码映射（兼容旧代码）
-    strategies = {
-        "ma_cross": MACrossStrategy,
-        "breakout": BreakoutStrategy,
-        "macd": MACDStrategy,
-        "bollinger": BollingerStrategy,
-        "turtle": TurtleStrategy,
-        "portfolio": PortfolioStrategy,
-        "ensemble": EnsembleStrategy,
-        "sector_rotation": SectorRotationStrategy,
-    }
-    
-    if strategy_name not in strategies:
-        available = list(registry.list_all().keys()) or list(strategies.keys())
-        raise ValueError(f"不支持的策略：{strategy_name}。可用策略: {available}")
-    
-    return strategies[strategy_name]
+    # 注册表中未找到，报错并列出可用策略
+    available = sorted(registry.list_all().keys())
+    raise ValueError(
+        f"不支持的策略: {strategy_name}。"
+        f"可用策略 ({len(available)} 个): {available}"
+    )

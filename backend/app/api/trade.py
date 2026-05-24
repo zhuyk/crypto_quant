@@ -305,10 +305,47 @@ async def create_order(order: OrderRequest):
     if order.order_type == "limit" and not order.price:
         raise OrderError("限价单必须指定价格", error_code="MISSING_PRICE")
     
-    # 检查是否可以开仓
+    # 检查是否可以开仓 (基础仓位检查)
     can_open, reason = pm.can_open_position(order.symbol, order.price or 0)
     if not can_open and order.side == "buy":
         raise OrderError(reason, error_code="POSITION_LIMIT_EXCEEDED")
+    
+    # 完整风控校验 (RiskManager)
+    try:
+        from engine.risk.risk_manager import RiskManager
+        risk_mgr = RiskManager(
+            initial_capital=settings.DEFAULT_INITIAL_CAPITAL,
+            max_drawdown=settings.MAX_DRAWDOWN,
+            max_daily_loss=settings.MAX_DAILY_LOSS,
+        )
+        
+        portfolio = pm.get_portfolio_summary()
+        risk_check = risk_mgr.check_trade_permission(
+            symbol=order.symbol,
+            side=order.side,
+            amount=order.amount,
+            price=order.price or 0,
+            current_equity=portfolio.get("capital", settings.DEFAULT_INITIAL_CAPITAL),
+            daily_pnl=portfolio.get("daily_pnl", 0),
+            current_drawdown=portfolio.get("current_drawdown", 0),
+        )
+        
+        if not risk_check.get("allowed", True):
+            risk_reason = risk_check.get("reason", "风控校验未通过")
+            logger.warning(f"⚠️ 风控拒绝订单: {risk_reason}")
+            raise OrderError(
+                f"风控拒绝: {risk_reason}",
+                error_code="RISK_CHECK_FAILED",
+                details=risk_check,
+            )
+    except ImportError:
+        # RiskManager 模块不可用，仅使用基础仓位检查（已通过）
+        pass
+    except OrderError:
+        raise
+    except Exception as e:
+        # 风控模块异常不阻断交易，但记录警告
+        logger.warning(f"风控校验异常（不阻断）: {e}")
     
     # 创建订单 (带重试)
     from engine.trader import OrderSide, OrderType

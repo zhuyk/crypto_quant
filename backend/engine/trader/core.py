@@ -16,6 +16,16 @@ class OrderSide(Enum):
     BUY = "buy"
     SELL = "sell"
 
+    def to_signal_side(self) -> str:
+        """转换为策略层 SignalSide 值"""
+        return "long" if self == OrderSide.BUY else "short"
+
+    @classmethod
+    def from_signal_side(cls, signal_side) -> "OrderSide":
+        """从策略层 SignalSide 转换"""
+        val = signal_side.value if hasattr(signal_side, "value") else str(signal_side)
+        return cls.BUY if val == "long" else cls.SELL
+
 
 class OrderType(Enum):
     """订单类型"""
@@ -116,6 +126,44 @@ class Position:
             "opened_at": self.opened_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+    def to_strategy_position(self):
+        """
+        转换为策略层 Position (strategies.base.Position)
+        
+        用于需要在策略和交易引擎之间传递持仓数据的场景。
+        """
+        from strategies.base import Position as StrategyPosition, SignalSide
+        side = SignalSide.LONG if self.side == OrderSide.BUY else SignalSide.SHORT
+        return StrategyPosition(
+            symbol=self.symbol,
+            side=side,
+            quantity=self.amount,
+            entry_price=self.entry_price,
+            current_price=self.current_price,
+            stop_loss=self.stop_loss,
+            take_profit=self.take_profit,
+        )
+
+    @classmethod
+    def from_strategy_position(cls, strategy_pos, leverage: float = 1.0) -> "Position":
+        """
+        从策略层 Position 创建交易层 Position
+        """
+        from strategies.base import SignalSide
+        side = OrderSide.BUY if strategy_pos.side == SignalSide.LONG else OrderSide.SELL
+        pos = cls(
+            symbol=strategy_pos.symbol,
+            side=side,
+            amount=strategy_pos.quantity,
+            entry_price=strategy_pos.entry_price,
+            current_price=strategy_pos.current_price,
+            stop_loss=strategy_pos.stop_loss,
+            take_profit=strategy_pos.take_profit,
+            leverage=leverage,
+        )
+        pos.update_price(strategy_pos.current_price)
+        return pos
 
 
 class TradingEngine:
