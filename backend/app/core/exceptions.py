@@ -31,6 +31,7 @@ __all__ = [
     "OrderError",
     "StrategyError",
     "ConfigurationError",
+    "DataNotAvailableError",
     # 工具函数
     "handle_exception",
     "error_response",
@@ -280,6 +281,22 @@ class ConfigurationError(CryptoQuantException):
             message=message,
             error_code="CONFIGURATION_ERROR",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            details=details,
+        )
+
+
+class DataNotAvailableError(CryptoQuantException):
+    """数据不可用错误 - 无法获取所需的市场数据"""
+    
+    def __init__(
+        self,
+        message: str = "所需数据不可用",
+        details: Optional[Dict] = None,
+    ):
+        super().__init__(
+            message=message,
+            error_code="DATA_NOT_AVAILABLE",
+            status_code=status.HTTP_404_NOT_FOUND,
             details=details,
         )
 

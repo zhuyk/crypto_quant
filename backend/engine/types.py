@@ -67,12 +67,12 @@ def order_side_to_signal_side(order_side) -> str:
 
 def strategy_position_to_trader_position(strategy_pos) -> dict:
     """
-    strategies.base.Position → engine.trader.core.Position 格式的字典
+    strategies.base.Position → engine.trader.core.TraderPosition 格式的字典
 
-    策略层 Position:
+    策略层 Position (规范类型):
         symbol, side (SignalSide), quantity, entry_price, current_price, stop_loss, take_profit
 
-    交易层 Position:
+    交易层 TraderPosition (引擎内部):
         symbol, side (OrderSide), amount, entry_price, current_price, stop_loss, take_profit, ...
     """
     return {
@@ -90,9 +90,9 @@ def strategy_position_to_trader_position(strategy_pos) -> dict:
 
 def trader_position_to_strategy_position(trader_pos) -> dict:
     """
-    engine.trader.core.Position → strategies.base.Position 格式的字典
+    engine.trader.core.TraderPosition → strategies.base.Position 格式的字典
 
-    交易层 → 策略层
+    交易层 TraderPosition → 策略层 Position
     """
     return {
         "symbol": trader_pos.symbol,

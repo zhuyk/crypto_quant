@@ -10,6 +10,8 @@ from loguru import logger
 from dataclasses import dataclass, field
 from enum import Enum
 
+from engine.risk.risk_manager import RiskManager
+
 
 class OrderSide(Enum):
     """订单方向"""
@@ -82,8 +84,8 @@ class Order:
 
 
 @dataclass
-class Position:
-    """持仓数据类"""
+class TraderPosition:
+    """交易层持仓数据类（实盘引擎使用）"""
     symbol: str
     side: OrderSide
     amount: float
@@ -132,6 +134,7 @@ class Position:
         转换为策略层 Position (strategies.base.Position)
         
         用于需要在策略和交易引擎之间传递持仓数据的场景。
+        策略层 Position 是唯一的规范持仓类型，本类 (TraderPosition) 仅限交易引擎内部使用。
         """
         from strategies.base import Position as StrategyPosition, SignalSide
         side = SignalSide.LONG if self.side == OrderSide.BUY else SignalSide.SHORT
@@ -146,9 +149,9 @@ class Position:
         )
 
     @classmethod
-    def from_strategy_position(cls, strategy_pos, leverage: float = 1.0) -> "Position":
+    def from_strategy_position(cls, strategy_pos, leverage: float = 1.0) -> "TraderPosition":
         """
-        从策略层 Position 创建交易层 Position
+        从策略层 Position 创建交易层 TraderPosition
         """
         from strategies.base import SignalSide
         side = OrderSide.BUY if strategy_pos.side == SignalSide.LONG else OrderSide.SELL
@@ -188,9 +191,12 @@ class TradingEngine:
         self.exchange: Optional[ccxt.Exchange] = None
         self._init_exchange()
         
+        # 风险管理器
+        self.risk_manager = RiskManager(initial_capital=initial_capital)
+        
         # 订单和持仓管理
         self.orders: Dict[str, Order] = {}
-        self.positions: Dict[str, Position] = {}
+        self.positions: Dict[str, TraderPosition] = {}
         
         # 交易历史
         self.trade_history: List[Dict] = []
@@ -330,6 +336,35 @@ class TradingEngine:
     ) -> Optional[Order]:
         """创建订单"""
         try:
+            # --- 风控校验 ---
+            # 估算订单价值
+            order_price = price or (self.get_ticker(symbol).get("last") or 0)
+            order_value = amount * order_price if order_price else None
+            
+            # 获取当前持仓市值
+            current_positions = {
+                sym: pos.amount * pos.current_price
+                for sym, pos in self.positions.items()
+            }
+            
+            risk_result = self.risk_manager.check_trade_permission(
+                symbol=symbol,
+                order_value=order_value,
+                current_positions=current_positions,
+                current_equity=self.capital,
+            )
+            
+            if not risk_result.can_trade:
+                reasons_str = "; ".join(risk_result.reasons)
+                logger.warning(
+                    f"⛔ 风控拒绝订单 - {side.value} {amount} {symbol}: {reasons_str}"
+                )
+                raise ValueError(f"风控拒绝: {reasons_str}")
+            
+            if risk_result.warnings:
+                for w in risk_result.warnings:
+                    logger.warning(f"⚠️ 风控警告: {w}")
+            
             # 准备订单参数
             params = {}
             if stop_loss:
@@ -412,11 +447,11 @@ class TradingEngine:
             return None
         return None
     
-    def get_position(self, symbol: str) -> Optional[Position]:
+    def get_position(self, symbol: str) -> Optional[TraderPosition]:
         """获取持仓"""
         return self.positions.get(symbol)
     
-    def get_all_positions(self) -> List[Position]:
+    def get_all_positions(self) -> List[TraderPosition]:
         """获取所有持仓"""
         return list(self.positions.values())
     

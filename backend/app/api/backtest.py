@@ -19,6 +19,7 @@ from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from app.core.database import async_get_db
+from app.core.exceptions import DataNotAvailableError
 from app.models.trade import BacktestRun
 from strategies.base import Strategy
 from strategies.registry import registry, get_strategy_class as registry_get_strategy
@@ -36,18 +37,26 @@ router = APIRouter(tags=["回测"])
 class BacktestRequest(BaseModel):
     """回测请求"""
     strategy_name: str = Field(..., description="策略名称")
-    symbol: str = Field("BTCUSDT", description="交易对")
+    symbol: str = Field("BTCUSDT", description="交易对（单symbol，向后兼容）")
+    symbols: Optional[List[str]] = Field(None, description="多交易对列表（优先级高于 symbol）")
     timeframe: str = Field("1h", description="时间周期")
     params: Dict[str, Any] = Field(default_factory=dict, description="策略参数")
     initial_capital: float = Field(100000.0, description="初始资金")
     start_time: Optional[int] = Field(None, description="开始时间 (毫秒时间戳)")
     end_time: Optional[int] = Field(None, description="结束时间 (毫秒时间戳)")
 
+    def get_symbols(self) -> List[str]:
+        """获取实际要回测的 symbol 列表"""
+        if self.symbols:
+            return self.symbols
+        return [self.symbol]
+
 
 class BacktestResponse(BaseModel):
     """回测响应"""
     success: bool
     report: Optional[Dict[str, Any]] = None
+    reports: Optional[Dict[str, Dict[str, Any]]] = None  # 多symbol时按symbol分组
     backtest_id: Optional[int] = None
     warning: Optional[str] = None  # 数据来源警告
     error: Optional[str] = None
@@ -92,14 +101,75 @@ async def run_backtest(request: BacktestRequest, db: Session = Depends(async_get
     """
     执行回测（结果自动保存到数据库）
     
+    支持单个或多个交易对：
+    - symbol: 单交易对（向后兼容）
+    - symbols: 多交易对列表（优先级更高）
+    
     支持策略：
     - ma_cross: 双均线交叉
     - breakout: 通道突破
     - macd: MACD 趋势
     """
     try:
-        # 加载数据
-        data = await _load_data(request.symbol, request.timeframe, request.start_time, request.end_time)
+        symbols = request.get_symbols()
+        
+        # --- 多 symbol 回测 ---
+        if len(symbols) > 1:
+            reports: Dict[str, Dict[str, Any]] = {}
+            warnings: List[str] = []
+            
+            for sym in symbols:
+                data = await _load_data(sym, request.timeframe, request.start_time, request.end_time)
+                
+                if data.empty:
+                    warnings.append(f"{sym}: 数据为空，跳过")
+                    continue
+                
+                strategy = _create_strategy(request.strategy_name, request.params)
+                backtester = Backtester(
+                    initial_capital=request.initial_capital / len(symbols),
+                    commission_rate=0.001,
+                    slippage=0.0005,
+                    timeframe=request.timeframe,
+                )
+                
+                report = backtester.run(strategy, data)
+                report_dict = report.to_dict()
+                
+                data_source = getattr(data, 'attrs', {}).get('_data_source', 'unknown')
+                report_dict['data_source'] = data_source
+                report_dict['data_points'] = len(data)
+                reports[sym] = report_dict
+                
+                # 保存每个 symbol 的回测记录
+                start_date = _parse_timestamp(request.start_time) or data.index[0].to_pydatetime()
+                end_date = _parse_timestamp(request.end_time) or data.index[-1].to_pydatetime()
+                _save_backtest_run(
+                    db=db,
+                    strategy_name=request.strategy_name,
+                    symbol=sym,
+                    timeframe=request.timeframe,
+                    start_date=start_date,
+                    end_date=end_date,
+                    initial_capital=request.initial_capital / len(symbols),
+                    report=report_dict,
+                    params=request.params,
+                )
+            
+            if not reports:
+                raise HTTPException(status_code=404, detail=f"所有交易对均无可用数据: {symbols}")
+            
+            logger.info(f"✅ 多symbol回测完成 [{len(reports)}/{len(symbols)}] {request.strategy_name}")
+            
+            return BacktestResponse(
+                success=True,
+                reports=reports,
+                warning="; ".join(warnings) if warnings else None,
+            )
+        
+        # --- 单 symbol 回测（原逻辑） ---
+        sym = symbols[0]
+        data = await _load_data(sym, request.timeframe, request.start_time, request.end_time)
         
         if data.empty:
             raise HTTPException(status_code=404, detail="未找到数据")
@@ -127,7 +197,7 @@ async def run_backtest(request: BacktestRequest, db: Session = Depends(async_get
         backtest_id = _save_backtest_run(
             db=db,
             strategy_name=request.strategy_name,
-            symbol=request.symbol,
+            symbol=sym,
             timeframe=request.timeframe,
             start_date=start_date,
             end_date=end_date,
@@ -136,27 +206,23 @@ async def run_backtest(request: BacktestRequest, db: Session = Depends(async_get
             params=request.params,
         )
         
-        logger.info(f"✅ 回测保存成功 [id={backtest_id}] {request.strategy_name} {request.symbol}")
+        logger.info(f"✅ 回测保存成功 [id={backtest_id}] {request.strategy_name} {sym}")
         
         # 标注数据来源
         data_source = getattr(data, 'attrs', {}).get('_data_source', 'unknown')
         report_dict['data_source'] = data_source
         report_dict['data_points'] = len(data)
         
-        # 如果使用了模拟数据，在响应中明确警告
-        warning = None
-        if data_source == 'mock':
-            warning = "⚠️ 本次回测使用模拟随机数据，结果仅供参考，不代表真实市场表现"
-        
         return BacktestResponse(
             success=True,
             report=report_dict,
             backtest_id=backtest_id,
-            warning=warning,
         )
         
     except HTTPException:
         raise
+    except DataNotAvailableError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception("回测执行失败")
         return BacktestResponse(
@@ -978,15 +1044,13 @@ async def _load_data(
                 df.attrs['_data_source'] = 'resampled_5m'
                 logger.info(f"✅ 从 5m 合成 {timeframe} 数据 {len(df)} 条")
             else:
-                logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
-                mock_df = _generate_mock_data(symbol, timeframe)
-                mock_df.attrs['_data_source'] = 'mock'
-                return mock_df
+                raise DataNotAvailableError(
+                    f"{symbol} {timeframe} 无可用数据（数据库、本地文件、5m合成均失败）"
+                )
         else:
-            logger.warning(f"⚠️ {symbol} {timeframe} 无真实数据，使用模拟数据")
-            mock_df = _generate_mock_data(symbol, timeframe)
-            mock_df.attrs['_data_source'] = 'mock'
-            return mock_df
+            raise DataNotAvailableError(
+                f"{symbol} {timeframe} 无可用数据（数据库和本地文件均无数据，且不支持从5m合成）"
+            )
     else:
         df.attrs['_data_source'] = 'json_file'
 
@@ -1001,30 +1065,16 @@ async def _load_data(
 
 
 def _generate_mock_data(symbol: str, timeframe: str) -> pd.DataFrame:
-    """生成模拟数据"""
-    import numpy as np
+    """
+    [已废弃] 模拟数据生成已被禁止。
     
-    n_bars = 1000
-    freq_map = {
-        "1m": "min", "5m": "5min", "15m": "15min",
-        "1h": "h", "4h": "4h", "1d": "D",
-    }
-    freq = freq_map.get(timeframe, "h")
-    dates = pd.date_range(start="2025-01-01", periods=n_bars, freq=freq)
-    
-    np.random.seed(42)
-    returns = np.random.randn(n_bars) * 0.02
-    close = 100 * np.cumprod(1 + returns)
-    
-    return pd.DataFrame({
-        "timestamp": dates,
-        "open": close * (1 + np.random.randn(n_bars) * 0.001),
-        "high": close * (1 + np.abs(np.random.randn(n_bars)) * 0.005),
-        "low": close * (1 - np.abs(np.random.randn(n_bars)) * 0.005),
-        "close": close,
-        "volume": np.random.rand(n_bars) * 1000000,
-        "symbol": symbol,
-    })
+    生产环境不应使用模拟数据进行回测，结果无意义。
+    请确保提前采集真实 K 线数据。
+    """
+    raise DataNotAvailableError(
+        f"禁止生成模拟数据: {symbol} {timeframe}。"
+        f"请先通过 data API 采集真实 K 线数据后再执行回测。"
+    )
 
 
 def _create_strategy(strategy_name: str, params: Dict[str, Any]) -> Strategy:
