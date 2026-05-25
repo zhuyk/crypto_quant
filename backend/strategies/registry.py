@@ -128,10 +128,12 @@ except Exception as e:
 try:
     # --- 趋势策略 ---
     from strategies.trend.ma_cross import MACrossStrategy
+    from strategies.trend.ma_single import MASingleStrategy
     from strategies.trend.breakout import BreakoutStrategy
     from strategies.trend.macd import MACDStrategy
     
     registry.register(MACrossStrategy)
+    registry.register(MASingleStrategy)
     registry.register(BreakoutStrategy)
     registry.register(MACDStrategy)
     
