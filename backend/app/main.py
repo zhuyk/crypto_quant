@@ -10,6 +10,7 @@ import logging
 from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.api.backtest import router as backtest_router
+from app.api.backtest_chart import router as backtest_chart_router
 from app.api.strategy import router as strategy_router
 from app.api.data import router as data_router
 from app.api.trade import router as trade_router
@@ -131,6 +132,7 @@ app.add_middleware(
 app.include_router(auth_router, prefix="/api/v1/auth")
 app.include_router(account_router, prefix="/api/v1/account")
 app.include_router(backtest_router, prefix="/api/v1/backtest")
+app.include_router(backtest_chart_router, prefix="/api/v1/backtest")
 app.include_router(strategy_router, prefix="/api/v1/strategy")
 app.include_router(data_router, prefix="/api/v1/data")
 app.include_router(trade_router, prefix="/api/v1/trade")
