@@ -1,12 +1,46 @@
 """
 Binance 数据采集器
 """
+import asyncio
 import ccxt
 import pandas as pd
 from datetime import datetime, timezone
 from typing import List, Optional, Dict
 from loguru import logger
 import time
+import functools
+
+
+def _retry(max_retries: int = 3, base_delay: float = 1.0, backoff: float = 2.0):
+    """
+    同步重试装饰器 (指数退避)
+    
+    适用于网络请求等可能瞬时失败的操作。
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            delay = base_delay
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, 
+                        ccxt.RequestTimeout, ConnectionError, TimeoutError) as e:
+                    last_exc = e
+                    if attempt == max_retries:
+                        break
+                    logger.warning(
+                        f"⚠️ {func.__name__} 重试 {attempt+1}/{max_retries} "
+                        f"(等待 {delay:.1f}s): {e}"
+                    )
+                    time.sleep(delay)
+                    delay *= backoff
+            # 所有重试耗尽
+            logger.error(f"❌ {func.__name__} 重试 {max_retries} 次后仍失败: {last_exc}")
+            raise last_exc
+        return wrapper
+    return decorator
 
 
 class BinanceCollector:
@@ -34,6 +68,7 @@ class BinanceCollector:
         
         logger.info(f"✅ Binance 采集器初始化完成 (testnet={testnet})")
     
+    @_retry(max_retries=3, base_delay=1.0, backoff=2.0)
     def fetch_klines(
         self,
         symbol: str,
@@ -42,49 +77,51 @@ class BinanceCollector:
         since: Optional[int] = None,
     ) -> pd.DataFrame:
         """
-        获取 K 线数据
+        获取 K 线数据（带自动重试）
         
         Args:
-            symbol: 交易对 (如 BTCUSDT)
+            symbol: 交易对 (如 BTC/USDT)
             timeframe: 时间周期 (1m, 5m, 15m, 1h, 4h, 1d)
             limit: 获取数量 (最多 1000)
             since: 起始时间戳 (毫秒)
         
         Returns:
             DataFrame with columns: timestamp, open, high, low, close, volume
+            
+        Raises:
+            ccxt.NetworkError: 网络异常（重试耗尽后）
+            ccxt.ExchangeError: 交易所返回错误（不重试）
         """
-        try:
-            # 获取 OHLCV 数据
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol=symbol,
-                timeframe=timeframe,
-                since=since,
-                limit=limit,
-            )
-            
-            # 转换为 DataFrame
-            df = pd.DataFrame(
-                ohlcv,
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            )
-            
-            # 转换时间戳
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            df.set_index('timestamp', inplace=True)
-            
-            # 数据类型转换
-            numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-            df[numeric_cols] = df[numeric_cols].astype(float)
-            
-            logger.debug(f"📊 获取 {symbol} {timeframe} 数据 {len(df)} 条")
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"❌ 获取 K 线数据失败：{symbol} {timeframe} - {e}")
+        # 获取 OHLCV 数据
+        ohlcv = self.exchange.fetch_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            since=since,
+            limit=limit,
+        )
+        
+        if not ohlcv:
             return pd.DataFrame()
+        
+        # 转换为 DataFrame
+        df = pd.DataFrame(
+            ohlcv,
+            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        )
+        
+        # 转换时间戳
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df.set_index('timestamp', inplace=True)
+        
+        # 数据类型转换
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        df[numeric_cols] = df[numeric_cols].astype(float)
+        
+        logger.debug(f"📊 获取 {symbol} {timeframe} 数据 {len(df)} 条")
+        
+        return df
     
-    def fetch_klines_paginated(
+    async def fetch_klines_paginated(
         self,
         symbol: str,
         timeframe: str = "1h",
@@ -93,7 +130,7 @@ class BinanceCollector:
         batch_size: int = 1000,
     ) -> pd.DataFrame:
         """
-        分页获取历史 K 线数据
+        分页获取历史 K 线数据（异步，不阻塞事件循环）
         
         Args:
             symbol: 交易对
@@ -121,13 +158,17 @@ class BinanceCollector:
         logger.info(f"📥 开始获取 {symbol} {timeframe} 历史数据...")
         
         while current_time < end_timestamp:
-            # 获取一批数据
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol=symbol,
-                timeframe=timeframe,
-                since=current_time,
-                limit=batch_size,
-            )
+            # 获取一批数据 (fetch_klines 已有重试)
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    since=current_time,
+                    limit=batch_size,
+                )
+            except Exception as e:
+                logger.error(f"❌ 分页获取失败 {symbol} {timeframe} since={current_time}: {e}")
+                break
             
             if not ohlcv:
                 break
@@ -137,8 +178,8 @@ class BinanceCollector:
             # 更新下次起始时间
             current_time = ohlcv[-1][0] + 1
             
-            # 避免频率限制
-            time.sleep(0.1)
+            # 使用 asyncio.sleep 避免阻塞事件循环
+            await asyncio.sleep(0.1)
             
             logger.debug(f"  已获取 {len(all_data)} 条...")
         

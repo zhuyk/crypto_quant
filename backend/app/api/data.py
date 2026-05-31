@@ -7,16 +7,21 @@
 - 异步非阻塞下载 (后台任务)
 - 正确的 symbol 解析 (支持 DOGE/MATIC 等 4+ 字符币种)
 - 下载进度跟踪
+- 使用 Depends(async_get_db) 统一 session 管理
 """
 
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
+from sqlalchemy.orm import Session
+from sqlalchemy import func, and_
 import asyncio
 import logging
 from datetime import datetime, timezone
 
 from app.core.config import settings
+from app.core.database import async_get_db
+from app.models.trade import Kline
 from data.persistence.kline_storage import get_kline_storage
 
 logger = logging.getLogger(__name__)
@@ -59,32 +64,24 @@ def normalize_symbol(symbol: str) -> tuple:
 # ============================================================
 
 @router.get("/symbols")
-async def get_symbols():
+async def get_symbols(db: Session = Depends(async_get_db)):
     """获取已存储的数据概览 (从数据库)"""
-    from app.core.database import SessionLocal
-    from app.models.trade import Kline
-    from sqlalchemy import func
+    stats = db.query(
+        Kline.symbol, Kline.timeframe, Kline.exchange,
+        func.count(Kline.id).label("count"),
+        func.min(Kline.timestamp).label("earliest"),
+        func.max(Kline.timestamp).label("latest"),
+    ).group_by(Kline.symbol, Kline.timeframe, Kline.exchange).all()
 
-    db = SessionLocal()
-    try:
-        stats = db.query(
-            Kline.symbol, Kline.timeframe, Kline.exchange,
-            func.count(Kline.id).label("count"),
-            func.min(Kline.timestamp).label("earliest"),
-            func.max(Kline.timestamp).label("latest"),
-        ).group_by(Kline.symbol, Kline.timeframe, Kline.exchange).all()
-
-        return [
-            {
-                "symbol": r.symbol, "timeframe": r.timeframe, "exchange": r.exchange,
-                "candle_count": r.count,
-                "start_time": int(r.earliest.timestamp() * 1000) if r.earliest else None,
-                "end_time": int(r.latest.timestamp() * 1000) if r.latest else None,
-            }
-            for r in stats
-        ]
-    finally:
-        db.close()
+    return [
+        {
+            "symbol": r.symbol, "timeframe": r.timeframe, "exchange": r.exchange,
+            "candle_count": r.count,
+            "start_time": int(r.earliest.timestamp() * 1000) if r.earliest else None,
+            "end_time": int(r.latest.timestamp() * 1000) if r.latest else None,
+        }
+        for r in stats
+    ]
 
 
 @router.get("/klines")
@@ -152,20 +149,18 @@ async def get_timeframes():
 
 
 @router.delete("/klines")
-async def delete_klines(symbol: str = Query(...), timeframe: str = Query(...)):
+async def delete_klines(
+    symbol: str = Query(...),
+    timeframe: str = Query(...),
+    db: Session = Depends(async_get_db),
+):
     """删除指定数据"""
-    from app.core.database import SessionLocal
-    from app.models.trade import Kline
-    from sqlalchemy import and_
-
     _, stor_sym = normalize_symbol(symbol)
-    db = SessionLocal()
-    try:
-        deleted = db.query(Kline).filter(and_(Kline.symbol == stor_sym, Kline.timeframe == timeframe)).delete(synchronize_session=False)
-        db.commit()
-        return {"success": True, "deleted_count": deleted}
-    finally:
-        db.close()
+    deleted = db.query(Kline).filter(
+        and_(Kline.symbol == stor_sym, Kline.timeframe == timeframe)
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"success": True, "deleted_count": deleted}
 
 
 # ============================================================

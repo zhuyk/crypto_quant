@@ -18,7 +18,7 @@ from typing import Optional, Any, Dict, List, TYPE_CHECKING
 
 from sqlalchemy import (
     String, Float, Boolean, DateTime, ForeignKey, Text, JSON,
-    BigInteger, Numeric, Integer, func,
+    BigInteger, Numeric, Integer, Index, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -225,12 +225,15 @@ class Position(Base):
 class Kline(Base):
     """K 线数据表"""
     __tablename__ = "klines"
+    __table_args__ = (
+        Index("ix_kline_composite", "exchange", "symbol", "timeframe", "timestamp", unique=True),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    exchange: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    symbol: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    timeframe: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    exchange: Mapped[str] = mapped_column(String(32), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     open: Mapped[float] = mapped_column(Float, nullable=False)
     high: Mapped[float] = mapped_column(Float, nullable=False)
     low: Mapped[float] = mapped_column(Float, nullable=False)

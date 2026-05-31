@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict
 
 import pandas as pd
-from sqlalchemy import and_, text
+from sqlalchemy import and_, text, func
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from app.core.database import SessionLocal, engine
+from app.core.config import settings
 from app.models.trade import Kline
 
 logger = logging.getLogger(__name__)
@@ -21,8 +23,8 @@ class KlineStorage:
     K线数据持久化服务
     
     功能:
-    - 批量写入K线数据到数据库
-    - 自动去重 (基于 exchange+symbol+timeframe+timestamp)
+    - 批量写入K线数据到数据库 (INSERT OR IGNORE / ON CONFLICT DO NOTHING)
+    - 自动去重依赖复合唯一索引 ix_kline_composite
     - 支持增量更新
     - 查询历史数据
     """
@@ -40,10 +42,13 @@ class KlineStorage:
         exchange: Optional[str] = None,
     ) -> int:
         """
-        批量保存K线数据
+        批量保存K线数据（使用 UPSERT / INSERT OR IGNORE 去重）
+        
+        依赖复合唯一索引 ix_kline_composite (exchange, symbol, timeframe, timestamp)
+        自动忽略已存在的记录，无需先查询最新时间戳。
         
         Args:
-            symbol: 交易对 (如 BTC/USDT)
+            symbol: 交易对 (如 BTCUSDT)
             timeframe: 时间周期 (1m, 5m, 15m, 1h, 4h, 1d)
             data: K线 DataFrame (index=timestamp, columns=[open, high, low, close, volume])
             exchange: 交易所名称
@@ -55,64 +60,79 @@ class KlineStorage:
             return 0
         
         exchange = exchange or self.exchange
+        
+        # 构建待插入记录列表 (纯字典，不创建 ORM 对象)
+        rows = []
+        for ts, row in data.iterrows():
+            if isinstance(ts, pd.Timestamp):
+                record_ts = ts.to_pydatetime()
+            else:
+                record_ts = ts
+            
+            # 统一为 naive UTC
+            if hasattr(record_ts, 'tzinfo') and record_ts.tzinfo:
+                record_ts = record_ts.replace(tzinfo=None)
+            
+            rows.append({
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": record_ts,
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close']),
+                "volume": float(row['volume']),
+            })
+        
+        if not rows:
+            return 0
+        
         db = SessionLocal()
         new_count = 0
         
         try:
-            # 获取该symbol+timeframe已有的最新时间戳
-            existing_latest = db.query(Kline.timestamp).filter(
-                and_(
-                    Kline.exchange == exchange,
-                    Kline.symbol == symbol,
-                    Kline.timeframe == timeframe,
-                )
-            ).order_by(Kline.timestamp.desc()).first()
-            
-            latest_ts = existing_latest[0] if existing_latest else None
-            
-            # 过滤出新数据
-            records = []
-            for ts, row in data.iterrows():
-                # ts 可能是 DatetimeIndex 或列值
-                if isinstance(ts, pd.Timestamp):
-                    record_ts = ts.to_pydatetime()
+            # 使用数据库原生 INSERT OR IGNORE / ON CONFLICT DO NOTHING
+            # 分批处理避免单条 SQL 过大
+            batch_size = 500
+            for i in range(0, len(rows), batch_size):
+                batch = rows[i:i + batch_size]
+                
+                if settings.is_sqlite:
+                    # SQLite: INSERT OR IGNORE
+                    stmt = sqlite_insert(Kline).values(batch)
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=["exchange", "symbol", "timeframe", "timestamp"]
+                    )
+                elif settings.is_mysql:
+                    # MySQL: INSERT IGNORE
+                    stmt = mysql_insert(Kline).values(batch)
+                    stmt = stmt.on_duplicate_key_update(
+                        close=stmt.inserted.close  # no-op update to use INSERT ON DUPLICATE
+                    )
                 else:
-                    record_ts = ts
+                    # PostgreSQL / fallback: ON CONFLICT DO NOTHING
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+                    stmt = pg_insert(Kline).values(batch)
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=["exchange", "symbol", "timeframe", "timestamp"]
+                    )
                 
-                # 如果有时区信息，转为 naive UTC
-                if hasattr(record_ts, 'tzinfo') and record_ts.tzinfo:
-                    record_ts = record_ts.replace(tzinfo=None)
-                
-                # 跳过已存在的数据
-                if latest_ts and record_ts <= latest_ts:
-                    self._total_duplicates += 1
-                    continue
-                
-                records.append(Kline(
-                    exchange=exchange,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    timestamp=record_ts,
-                    open=float(row['open']),
-                    high=float(row['high']),
-                    low=float(row['low']),
-                    close=float(row['close']),
-                    volume=float(row['volume']),
-                ))
+                result = db.execute(stmt)
+                new_count += result.rowcount
             
-            # 批量写入
-            if records:
-                db.bulk_save_objects(records)
-                db.commit()
-                new_count = len(records)
-                self._total_written += new_count
+            db.commit()
+            
+            self._total_written += new_count
+            self._total_duplicates += (len(rows) - new_count)
+            
+            if new_count > 0:
                 logger.info(
-                    f"💾 已存储 {new_count} 条K线 | "
-                    f"{exchange}:{symbol} {timeframe} | "
-                    f"最新: {records[-1].timestamp}"
+                    f"💾 已存储 {new_count} 条K线 (跳过 {len(rows) - new_count} 重复) | "
+                    f"{exchange}:{symbol} {timeframe}"
                 )
             else:
-                logger.debug(f"📊 {symbol} {timeframe} 无新数据需要存储")
+                logger.debug(f"📊 {symbol} {timeframe} 无新数据需要存储 ({len(rows)} 条均已存在)")
                 
         except Exception as e:
             db.rollback()
@@ -133,7 +153,9 @@ class KlineStorage:
         exchange: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        从数据库查询K线数据
+        从数据库查询K线数据（按时间正序返回）
+        
+        使用子查询 + ASC 排序避免大结果集的 Python 反转开销。
         
         Args:
             symbol: 交易对
@@ -144,7 +166,7 @@ class KlineStorage:
             exchange: 交易所
             
         Returns:
-            pd.DataFrame with OHLCV data
+            pd.DataFrame with OHLCV data, index=timestamp (时间正序)
         """
         exchange = exchange or self.exchange
         db = SessionLocal()
@@ -163,13 +185,23 @@ class KlineStorage:
             if end_time:
                 query = query.filter(Kline.timestamp <= end_time)
             
-            query = query.order_by(Kline.timestamp.desc()).limit(limit)
+            # 直接按 ASC 排序，取最新的 limit 条用子查询
+            # 如果有 start_time 限定，直接 ASC + limit 即可
+            if start_time:
+                query = query.order_by(Kline.timestamp.asc()).limit(limit)
+            else:
+                # 无 start_time 时取最近 N 条: 先 DESC limit，再外层 ASC
+                # 使用 subquery 避免 Python 反转
+                from sqlalchemy.orm import aliased
+                subq = query.order_by(Kline.timestamp.desc()).limit(limit).subquery()
+                query = db.query(Kline).select_entity_from(subq).order_by(subq.c.timestamp.asc())
+            
             results = query.all()
             
             if not results:
                 return pd.DataFrame()
             
-            # 转换为 DataFrame
+            # 转换为 DataFrame (已按时间正序)
             records = [{
                 'timestamp': r.timestamp,
                 'open': r.open,
@@ -177,7 +209,7 @@ class KlineStorage:
                 'low': r.low,
                 'close': r.close,
                 'volume': r.volume,
-            } for r in reversed(results)]  # 反转为时间正序
+            } for r in results]
             
             df = pd.DataFrame(records)
             df.set_index('timestamp', inplace=True)
@@ -200,15 +232,15 @@ class KlineStorage:
         db = SessionLocal()
         
         try:
-            result = db.query(Kline.timestamp).filter(
+            result = db.query(func.max(Kline.timestamp)).filter(
                 and_(
                     Kline.exchange == exchange,
                     Kline.symbol == symbol,
                     Kline.timeframe == timeframe,
                 )
-            ).order_by(Kline.timestamp.desc()).first()
+            ).scalar()
             
-            return result[0] if result else None
+            return result
         finally:
             db.close()
     
@@ -216,7 +248,7 @@ class KlineStorage:
         """获取存储统计"""
         db = SessionLocal()
         try:
-            total_records = db.query(Kline).count()
+            total_records = db.query(func.count(Kline.id)).scalar()
             return {
                 "total_records": total_records,
                 "total_written_session": self._total_written,
